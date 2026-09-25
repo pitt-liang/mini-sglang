@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import timedelta
 from typing import Any, Dict, NamedTuple, Tuple
 
@@ -42,6 +43,12 @@ class Engine:
         set_global_ctx(self.ctx)
 
         self.tp_cpu_group = self._init_communication(config)
+        if config.model_config.is_qwen4 and os.environ.get("MINISGL_QWEN4_MNNVL") == "1":
+            from minisgl.distributed.flashinfer import enable_flashinfer_allreduce
+
+            enable_flashinfer_allreduce(
+                config.tp_info, self.tp_cpu_group, 2 * config.model_config.hidden_size
+            )
         init_free_memory = self._sync_get_memory()[1]
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
@@ -49,7 +56,14 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
-        self.model.load_state_dict(self._load_weight_state_dict(config))
+        if config.model_config.is_qwen4:
+            if config.use_dummy_weight:
+                raise ValueError(
+                    "Qwen4 dummy weights are not supported; PLE hash buffers must be valid"
+                )
+            self.model.load_weights(config.model_path, self.device)
+        else:
+            self.model.load_state_dict(self._load_weight_state_dict(config))
 
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
@@ -60,6 +74,7 @@ class Engine:
             page_size=config.page_size,
             device=self.device,
             dtype=self.dtype,
+            max_running_req=config.max_running_req,
         )
 
         # ======================= Page table initialization ========================
@@ -153,12 +168,35 @@ class Engine:
             * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
             * config.page_size
             * self.dtype.itemsize
-            * config.model_config.num_layers
+            * config.model_config.num_kv_layers
         )
+        state_bytes = 0
+        if config.model_config.is_qwen4:
+            from minisgl.kvcache.qwen4_pool import recurrent_bytes
+
+            c = config.model_config.hybrid
+            cache_per_page += (
+                config.model_config.num_kv_layers
+                * c["indexer_head_dim"]
+                * self.dtype.itemsize
+                * config.page_size
+                // c["indexer_compress_ratio"]
+            )
+            state_bytes = recurrent_bytes(
+                config.model_config, config.max_running_req + 1, config.tp_info.size, self.dtype
+            )
         num_pages = config.num_page_override
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
-            available_memory = int(config.memory_ratio * old_free_memory) - model_memory
+            available_memory = (
+                int(config.memory_ratio * old_free_memory) - model_memory - state_bytes
+            )
+            if available_memory <= cache_per_page:
+                raise ValueError(
+                    f"No KV budget remains after weights ({mem_GB(model_memory)}) and "
+                    f"request state ({mem_GB(state_bytes)}). Increase --memory-ratio, "
+                    "reduce --max-running-requests, or use more model-compatible TP ranks."
+                )
             num_pages = available_memory // cache_per_page
 
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
@@ -207,8 +245,8 @@ class Engine:
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
-        torch.distributed.destroy_process_group()
         destroy_distributed()
+        torch.distributed.destroy_process_group()
 
 
 def _align_up_32(num: int) -> int:
@@ -218,6 +256,29 @@ def _align_up_32(num: int) -> int:
 def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
+
+    if config.model_config.is_qwen4:
+        from minisgl.models import qwen4_fast
+
+        if config.attention_backend not in ("auto", "qwen4"):
+            raise ValueError("Qwen4 requires the qwen4 hybrid attention backend")
+        if not qwen4_fast.enabled() and (
+            config.cuda_graph_max_bs not in (None, 0) or config.cuda_graph_bs
+        ):
+            raise ValueError("Qwen4 eager baseline does not support CUDA graphs")
+        if config.dtype != torch.bfloat16:
+            raise ValueError("Qwen4 currently supports BF16 weights only")
+        override("attention_backend", "qwen4")
+        if config.cuda_graph_max_bs is None and not config.cuda_graph_bs:
+            override("cuda_graph_max_bs", 4 if qwen4_fast.enabled() else 0)
+        if config.page_size == 1:
+            override("page_size", config.model_config.hybrid["indexer_compress_ratio"])
+        if hasattr(config, "cache_type"):
+            override("cache_type", "naive")
+        logger.warning_rank0(
+            "Qwen4 experimental BF16 text path: naive cache, no vision/MTP/quantization; "
+            "MINISGL_QWEN4_REFERENCE=1 selects the eager reference implementation"
+        )
 
     if config.attention_backend == "auto":
         backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")

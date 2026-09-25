@@ -19,6 +19,13 @@ class BackendCreator(Protocol):
 SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
 
 
+@SUPPORTED_ATTENTION_BACKENDS.register("qwen4")
+def create_qwen4_backend(config: ModelConfig):
+    from .qwen4 import Qwen4Backend
+
+    return Qwen4Backend(config)
+
+
 @SUPPORTED_ATTENTION_BACKENDS.register("trtllm")
 def create_trtllm_backend(config: ModelConfig):
     from .trtllm import TensorRTLLMBackend

@@ -25,8 +25,13 @@ def fused_moe_kernel_triton(
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
     padded_size = 0
+    # At most one padded block per routed token can be nonempty. The alignment
+    # buffer reserves padding for every expert, which grossly overlaunches the
+    # decode GEMMs (e.g. 512 experts but only 10 selected routes). Keep the full
+    # buffer for the alignment kernel, but bound the GEMM launch independently.
+    max_rows = min(sorted_token_ids.shape[0], topk_ids.numel() * config["BLOCK_SIZE_M"])
     grid = lambda META: (
-        triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
+        triton.cdiv(max_rows, META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
     )
     K = B.shape[2] - padded_size
@@ -45,7 +50,7 @@ def fused_moe_kernel_triton(
         num_tokens_post_padded,
         B.shape[1],
         B.shape[2] - padded_size,
-        sorted_token_ids.shape[0],
+        max_rows,
         topk_ids.numel(),
         A.stride(0),
         A.stride(1),

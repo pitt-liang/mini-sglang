@@ -42,7 +42,9 @@ class MoELayer(BaseOP):
             intermediate_size_per_partition,
         )
 
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor, reduce_results=True
+    ):
         ctx = get_global_ctx()
         final_hidden_states = ctx.moe_backend.forward(
             hidden_states=hidden_states,
@@ -54,6 +56,6 @@ class MoELayer(BaseOP):
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
         )
-        if self.tp_size > 1:
+        if self.tp_size > 1 and reduce_results:
             final_hidden_states = self._comm.all_reduce(final_hidden_states)
         return final_hidden_states

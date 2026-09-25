@@ -1,3 +1,4 @@
+import copy
 import functools
 import json
 import os
@@ -6,6 +7,7 @@ from typing import Any
 from huggingface_hub import hf_hub_download, snapshot_download
 from tqdm.asyncio import tqdm
 from transformers import AutoConfig, AutoTokenizer, PretrainedConfig, PreTrainedTokenizerBase
+
 
 class DisabledTqdm(tqdm):
     def __init__(self, *args, **kwargs):
@@ -29,12 +31,19 @@ def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
 
 @functools.cache
 def _load_hf_config(model_path: str) -> Any:
+    # Read the native schema without remote code. The pinned Transformers version
+    # predates Qwen4; only this explicitly supported architecture uses the fallback.
+    raw, _ = PretrainedConfig.get_config_dict(model_path)
+    if raw.get("model_type") in ("qwen4_exp", "qwen4_exp_text"):
+        if not raw.get("dtype"):
+            raw["dtype"] = raw.get("text_config", {}).get("dtype", "bfloat16")
+        return PretrainedConfig.from_dict(raw)
     return AutoConfig.from_pretrained(model_path)
 
 
 def cached_load_hf_config(model_path: str) -> PretrainedConfig:
     config = _load_hf_config(model_path)
-    return type(config)(**config.to_dict())
+    return copy.deepcopy(config)
 
 
 def download_hf_weight(model_path: str) -> str:
@@ -43,7 +52,7 @@ def download_hf_weight(model_path: str) -> str:
     try:
         return snapshot_download(
             model_path,
-            allow_patterns=["*.safetensors"],
+            allow_patterns=["*.safetensors", "*.safetensors.index.json"],
             tqdm_class=DisabledTqdm,
         )
     except Exception as e:

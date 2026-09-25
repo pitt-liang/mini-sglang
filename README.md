@@ -31,12 +31,16 @@ Mini-SGLang is a compact implementation of [SGLang](https://github.com/sgl-proje
 We recommend using `uv` for a fast and reliable installation (note that `uv` does not conflict with `conda`).
 
 ```bash
-# Create a virtual environment (Python 3.10+ recommended)
-uv venv --python=3.12
+# Run from the mini-sglang checkout; creates its own .venv from pyproject.toml/uv.lock.
+uv sync --locked --python 3.12
 source .venv/bin/activate
 ```
 
-**Prerequisites**: Mini-SGLang relies on CUDA kernels that are JIT-compiled. Ensure you have the **NVIDIA CUDA Toolkit** installed and that its version matches your driver's version. You can check your driver's CUDA capability with `nvidia-smi`.
+**Prerequisites**: This checkout pins the validated Torch 2.13 / CUDA 13.0 runtime
+and Transformers 5.12.1. Use Python 3.12 (minimum 3.11), a CUDA-13-capable driver,
+and a compatible **NVIDIA CUDA Toolkit** for JIT compilation. A virtual environment
+isolates Python packages, not the host driver/toolkit. SGLang is not a runtime
+dependency; do not activate or reuse `sglang/.venv-perf` to run Mini-SGLang.
 
 ### 2. Installation
 
@@ -44,9 +48,21 @@ Install Mini-SGLang directly from the source:
 
 ```bash
 git clone https://github.com/sgl-project/mini-sglang.git
-cd mini-sglang && uv venv --python=3.12 && source .venv/bin/activate
-uv pip install -e .
+cd mini-sglang
+uv sync --locked --python 3.12
+source .venv/bin/activate
 ```
+
+For tests and development, use `uv sync --locked --extra dev`. `uv sync` installs
+this checkout in editable mode; `uv run --locked` or `.venv/bin/python` uses its
+local environment without a `PYTHONPATH` override. Commit `uv.lock` together with
+dependency changes. `sglang-kernel` (imported as `sgl_kernel`) is a standalone
+operator package used by other backends, not the SGLang framework.
+On aarch64, `uv pip check` reports an upstream wheel-tag mismatch for Torch's
+pinned `nvidia-cusparselt-cu13==0.8.1`; its shared library is aarch64, but its
+internal wheel tag says `sbsa`. The installed operator wheel also does not include
+the legacy FA3 backend. This runtime has been validated for the GB200 Qwen4 path,
+not all legacy GPU/backend combinations.
 
 <details>
 <summary><b>💡 Installing on Windows (WSL2)</b></summary>
@@ -67,8 +83,9 @@ Since Mini-SGLang requires Linux-specific dependencies, Windows users should use
    ```bash
    # Inside WSL2 terminal
    git clone https://github.com/sgl-project/mini-sglang.git
-   cd mini-sglang && uv venv --python=3.12 && source .venv/bin/activate
-   uv pip install -e .
+   cd mini-sglang
+   uv sync --locked --python 3.12
+   source .venv/bin/activate
    ```
 
 4. **Access from Windows**: The server will be accessible at `http://localhost:8000` from Windows browsers and applications.
@@ -123,6 +140,36 @@ python -m minisgl --model "meta-llama/Llama-3.1-70B-Instruct" --tp 4 --port 3000
 ```
 
 Once the server is running, you can send requests using standard tools like `curl` or any OpenAI-compatible client.
+
+Qwen3.8-Flash-Next has an experimental native BF16 **text-only** path (GR, GDN,
+QSA, shared/routed MoE and GPU-resident PLE). It supports batched CUDA Graph decode,
+paged sparse prefill and FP32 recurrent state. Prefix reuse, vision, MTP and
+quantization are not supported. Optimized BF16 kernels are not bit-equivalent to
+the reference path; set `MINISGL_QWEN4_REFERENCE=1` and pass
+`--cuda-graph-max-bs 0` to select the eager reference.
+A GB200 numerical-alignment path is enabled by default on SM100/CUDA 13+.
+`MINISGL_QWEN4_SGLANG_NUMERICS=1` requires it explicitly; `=0` selects the older
+fast path. This is separate from the older mini reference switch.
+Alignment targets Torch dense GEMM, Triton MoE and FP32 recurrent state; stock
+sparse top-k tie ordering is nondeterministic. This does not imply performance
+parity or bit-exact outputs for every SGLang backend.
+
+Example configuration for two GB200 GPUs (BF16 weights use approximately
+166 GiB per rank before cache and workspace):
+
+```bash
+MINISGL_QWEN4_MNNVL=1 .venv/bin/python -m minisgl \
+  --model-path /path/to/Qwen3.8-Flash-Next --tp-size 2 \
+  --max-running-requests 4 --max-seq-len-override 8192 \
+  --num-pages 512 --page-size 64 --cuda-graph-max-bs 4 --disable-pynccl
+```
+
+`MINISGL_QWEN4_MNNVL=1` enables optional NVLink multicast all-reduce. Run regression
+tests with `python -m pytest tests/models tests/core/test_cache_allocate.py`.
+Set `QWEN4_MODEL` to a local checkpoint and `QWEN4_HF_SOURCE` to an independent
+Transformers `modeling_qwen4_exp.py` to enable their optional reference checks.
+SGLang operator parity tests skip when the reference framework is unavailable;
+it is not required in the production environment.
 
 ### 4. Interactive Shell
 

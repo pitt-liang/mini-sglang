@@ -68,6 +68,10 @@ class Scheduler(SchedulerIOMixin):
         self.finished_reqs: Set[Req] = set()
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
+        self.eos_token_ids = {self.eos_token_id}
+        if config.model_config.is_qwen4:
+            eos = config.model_config.hybrid["eos_token_id"]
+            self.eos_token_ids.update(eos if isinstance(eos, list) else [eos])
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
         # self.config = config
@@ -145,14 +149,16 @@ class Scheduler(SchedulerIOMixin):
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
-                if isinstance(req, ChunkedReq):
+                if isinstance(req, ChunkedReq) or req in self.finished_reqs:
                     continue
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
-                finished = not req.can_decode
+                # device_len may already include the next overlapped forward.
+                # Only committed host tokens determine output-length completion.
+                finished = len(req.input_ids) >= req.max_device_len
                 if not req.sampling_params.ignore_eos:
-                    finished |= next_token == self.eos_token_id
+                    finished |= next_token in self.eos_token_ids
                 reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
@@ -193,6 +199,7 @@ class Scheduler(SchedulerIOMixin):
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
             if req_to_free is not None:
                 self._free_req_resources(req_to_free)
+                self.finished_reqs.add(req_to_free)
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError

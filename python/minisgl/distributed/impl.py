@@ -94,4 +94,7 @@ def destroy_distributed() -> None:
     """
     Destroy all the distributed communication plugins.
     """
+    for plugin in reversed(DistributedCommunicator.plugins):
+        if hasattr(plugin, "destroy"):
+            plugin.destroy()
     DistributedCommunicator.plugins = []
