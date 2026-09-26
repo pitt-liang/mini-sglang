@@ -3,7 +3,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from minisgl.core import get_global_ctx
-from minisgl.models import qwen4_fast
 from minisgl.models.qwen4_ops import rms_norm, rotary
 
 from .base import BaseAttnBackend, BaseAttnMetadata
@@ -26,6 +25,9 @@ class Qwen4Metadata(BaseAttnMetadata):
 class Qwen4ReferenceBackend(BaseAttnBackend):
     def __init__(self, config):
         self.config = config
+        self.runtime = config.qwen4_runtime
+        if self.runtime.aligned is None:
+            raise ValueError("Qwen4 attention requires a resolved execution policy")
 
     def prepare_metadata(self, batch):
         spans, offset = [], 0
@@ -147,7 +149,7 @@ class Qwen4Backend(Qwen4ReferenceBackend):
             )
 
     def init_capture_graph(self, max_seq_len, bs_list):
-        if not qwen4_fast.enabled():
+        if not self.runtime.enabled():
             return super().init_capture_graph(max_seq_len, bs_list)
         device = get_global_ctx().kv_cache.device
         n = max(bs_list)
@@ -173,7 +175,7 @@ class Qwen4Backend(Qwen4ReferenceBackend):
         dst.valid[:n].copy_(src.valid)
 
     def qsa(self, q, k, v, iq, raw_keys, index_norm, layer_id):
-        if not qwen4_fast.enabled():
+        if not self.runtime.enabled():
             return super().qsa(q, k, v, iq, raw_keys, index_norm, layer_id)
         from minisgl.kernel.qwen4_qsa import (
             compress_decode,
@@ -187,8 +189,8 @@ class Qwen4Backend(Qwen4ReferenceBackend):
         batch, pool, table = ctx.batch, ctx.kv_cache, ctx.page_table
         m, rc = batch.attn_metadata, self.config.rotary_config
         rope_cache = None
-        if qwen4_fast.SGLANG_NUMERICS:
-            from minisgl.kernel import qwen4_sglang as aligned
+        if self.runtime.aligned:
+            from minisgl.kernel import qwen4_ops as aligned
 
             rope_cache = aligned.rope_cache(q.device, rc.rotary_dim, rc.base, rc.max_position)
         ratio, budget = c["indexer_compress_ratio"], c["indexer_budget"]
@@ -211,7 +213,7 @@ class Qwen4Backend(Qwen4ReferenceBackend):
                 self.config.rms_norm_eps,
                 rope_cache=rope_cache,
             )
-            if qwen4_fast.SGLANG_NUMERICS:
+            if self.runtime.aligned:
                 scores = index_scores_decode(
                     iq, pool.index_keys[li], table, m.slots, m.lengths, m.valid, ratio, budget
                 )
@@ -219,7 +221,7 @@ class Qwen4Backend(Qwen4ReferenceBackend):
                 chosen = aligned.index_topk(scores, torch.where(m.valid, nb, 0))
                 indices = self.expand(chosen, nb, m.lengths, m.valid, ratio)
                 return self.aligned_decode(q, kc, vc, indices, table, m.slots)
-            if table.shape[1] // ratio <= 2048 and not qwen4_fast.SGLANG_NUMERICS:
+            if table.shape[1] // ratio <= 2048 and not self.runtime.aligned:
                 indices = select_decode(
                     iq, pool.index_keys[li], table, m.slots, m.lengths, m.valid, ratio, budget
                 )
@@ -253,7 +255,7 @@ class Qwen4Backend(Qwen4ReferenceBackend):
                 starts = torch.arange(
                     cached - past, cached - past + complete * ratio, ratio, device=q.device
                 )
-                if qwen4_fast.SGLANG_NUMERICS:
+                if self.runtime.aligned:
                     pooled = aligned.index_norm_rope(
                         pooled[:, None], index_norm, starts, rope_cache, self.config.rms_norm_eps
                     )[:, 0]
@@ -271,7 +273,7 @@ class Qwen4Backend(Qwen4ReferenceBackend):
             # attention. Keep the reference SDPA path for its numerical contract
             # and efficient multi-query prefill tiles.
             dense_count = max(0, min(b - a, budget - cached))
-            if qwen4_fast.SGLANG_NUMERICS:
+            if self.runtime.aligned:
                 dense_count = 0
             if dense_count:
                 dense_end = cached + dense_count
@@ -303,7 +305,7 @@ class Qwen4Backend(Qwen4ReferenceBackend):
                 if nb:
                     scores = (iq[start:stop].float() @ keys.T).relu().sum(1)
                     scores = scores.masked_fill(blocks[None, :] >= counts[:, None], -float("inf"))
-                    if qwen4_fast.SGLANG_NUMERICS:
+                    if self.runtime.aligned:
                         scores = scores / (iq.shape[-1] ** 0.5)
                         chosen = aligned.index_topk(scores.contiguous(), counts)
                     else:
@@ -324,13 +326,12 @@ class Qwen4Backend(Qwen4ReferenceBackend):
                     indices,
                     table,
                     slots,
-                    sglang_prefill_rows=q.shape[0] if qwen4_fast.SGLANG_NUMERICS else None,
+                    sglang_prefill_rows=q.shape[0] if self.runtime.aligned else None,
                 )
         return out
 
-    @staticmethod
-    def expand(chosen, counts, lengths, valid, ratio):
-        if qwen4_fast.SGLANG_NUMERICS:
+    def expand(self, chosen, counts, lengths, valid, ratio):
+        if self.runtime.aligned:
             from minisgl.kernel.qwen4_qsa import expand_compact
 
             return expand_compact(chosen, counts, lengths, valid, ratio)

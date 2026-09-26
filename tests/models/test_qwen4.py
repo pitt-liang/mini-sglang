@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
-from minisgl.models.config import ModelConfig
+from minisgl.models.config import ModelConfig, Qwen4RuntimeConfig
 from minisgl.models.qwen4_ops import causal_conv, l2_norm, ngram_ids, rms_norm, rotary
 from minisgl.utils.hf import cached_load_hf_config
 
@@ -108,7 +108,9 @@ class Qwen4OpsTest(unittest.TestCase):
         batch = SimpleNamespace(reqs=[req])
         ctx = SimpleNamespace(kv_cache=SimpleNamespace(device="cpu"))
         with patch("minisgl.attention.qwen4.get_global_ctx", return_value=ctx):
-            Qwen4Backend(None).prepare_metadata(batch)
+            Qwen4Backend(
+                SimpleNamespace(qwen4_runtime=Qwen4RuntimeConfig(aligned=False))
+            ).prepare_metadata(batch)
         req.cached_len, req.device_len = 9, 10
         self.assertEqual(batch.attn_metadata.spans, ((3, 5, 9, 0, 4),))
         self.assertEqual(batch.attn_metadata.last_indices.tolist(), [3])
@@ -127,11 +129,12 @@ class Qwen4OpsTest(unittest.TestCase):
         self.assertLess(recurrent_bytes(c, 1, 2, torch.bfloat16), 56 * 2**20)
 
     def test_norm_and_gr_against_hf(self):
-        from minisgl.models.qwen4_exp import GatedResidual
+        from minisgl.models.qwen4 import GatedResidual
 
         ref = independent_hf_reference()
         torch.manual_seed(5)
         cfg = SimpleNamespace(
+            qwen4_runtime=Qwen4RuntimeConfig(reference=True, aligned=False),
             hidden_size=32,
             hybrid={"hc_count": 4, "hc_lowrank": 8},
             hc_count=4,
@@ -201,7 +204,11 @@ class Qwen4OpsTest(unittest.TestCase):
 
         ref = independent_hf_reference()
         cfg = SimpleNamespace(
-            num_experts=8, hidden_size=128, moe_intermediate_size=64, hidden_act="silu"
+            qwen4_runtime=Qwen4RuntimeConfig(reference=True, aligned=False),
+            num_experts=8,
+            hidden_size=128,
+            moe_intermediate_size=64,
+            hidden_act="silu",
         )
         golden = ref["Qwen4ExpTextExperts"](cfg).to(device="cuda", dtype=torch.bfloat16)
         torch.manual_seed(21)
@@ -220,7 +227,7 @@ class Qwen4OpsTest(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_bf16_narrow_gate_chunk_stability(self):
-        from minisgl.models.qwen4_exp import NarrowLinear
+        from minisgl.models.qwen4 import NarrowLinear
 
         torch.manual_seed(19)
         op = NarrowLinear(10240, 4, False)
@@ -250,6 +257,7 @@ class Qwen4OpsTest(unittest.TestCase):
             "eos_token_id": 17,
         }
         cfg = SimpleNamespace(
+            qwen4_runtime=Qwen4RuntimeConfig(aligned=False),
             hybrid=c,
             num_kv_heads=2,
             num_kv_layers=1,
@@ -372,6 +380,54 @@ class Qwen4OpsTest(unittest.TestCase):
                     )
                 torch.testing.assert_close(torch.cat(chunks), actual, atol=0, rtol=0)
                 torch.testing.assert_close(state2, state, atol=0, rtol=0)
+
+
+class Qwen4PackingTest(unittest.TestCase):
+    def test_projection_order_and_parameter_views(self):
+        from minisgl.models.qwen4_weight import pack_qwen4_weights
+
+        def projection(value, rows=1):
+            return SimpleNamespace(weight=torch.full((rows, 4), float(value)))
+
+        for aligned in (False, True):
+            with self.subTest(aligned=aligned):
+                attn = SimpleNamespace(
+                    in_proj_qkv=projection(1, 3),
+                    in_proj_z=projection(2, 2),
+                    in_proj_a=projection(3),
+                    in_proj_b=projection(4),
+                )
+                mlp = SimpleNamespace(
+                    shared_expert=SimpleNamespace(gate_proj=projection(5), up_proj=projection(6))
+                )
+                model = SimpleNamespace(
+                    runtime=Qwen4RuntimeConfig(aligned=aligned),
+                    model=SimpleNamespace(
+                        layers=SimpleNamespace(
+                            op_list=[SimpleNamespace(linear_attn=attn, self_attn=None, mlp=mlp)]
+                        )
+                    ),
+                )
+                # Isolate projection layout from the SM100-specific HC permutation.
+                with patch("torch.cuda.get_device_capability", return_value=(9, 0)):
+                    pack_qwen4_weights(model)
+                expected = [1, 1, 1, 2, 2] + ([4, 3] if aligned else [3, 4])
+                torch.testing.assert_close(attn._packed[:, 0], torch.tensor(expected).float())
+                torch.testing.assert_close(mlp._packed[:, 0], torch.tensor([5.0, 6.0]))
+                for name in ("qkv", "z", "a", "b"):
+                    weight = getattr(attn, f"in_proj_{name}").weight
+                    self.assertEqual(
+                        weight.untyped_storage().data_ptr(),
+                        attn._packed.untyped_storage().data_ptr(),
+                    )
+                attn.in_proj_a.weight.fill_(9)
+                self.assertEqual(attn._packed[-1 if aligned else -2, 0].item(), 9)
+
+    def test_unresolved_policy_rejected(self):
+        from minisgl.models.qwen4_weight import pack_qwen4_weights
+
+        with self.assertRaises(ValueError):
+            pack_qwen4_weights(SimpleNamespace(runtime=Qwen4RuntimeConfig()))
 
 
 if __name__ == "__main__":

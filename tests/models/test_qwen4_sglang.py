@@ -6,34 +6,67 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import qwen4_test_utils as oracle
 import torch
 import triton
-from minisgl.kernel import qwen4_sglang as mini
+from minisgl.kernel import qwen4_ops as mini
+from minisgl.models.config import Qwen4RuntimeConfig
 
 
 class TestNumericsSelection(unittest.TestCase):
     def test_default_and_explicit_override(self):
-        from minisgl.models import qwen4_fast
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+            patch("torch.version.cuda", "13.0"),
+        ):
+            os.environ.pop("MINISGL_QWEN4_REFERENCE", None)
+            os.environ.pop("MINISGL_QWEN4_SGLANG_NUMERICS", None)
+            auto = Qwen4RuntimeConfig.from_env()
+            self.assertIsNone(auto.aligned)
+            first = auto.resolve(torch.device("cuda"))
+            self.assertTrue(first.aligned)
+            os.environ["MINISGL_QWEN4_SGLANG_NUMERICS"] = "0"
+            second = Qwen4RuntimeConfig.from_env().resolve(torch.device("cuda"))
+            self.assertFalse(second.aligned)
+            self.assertTrue(first.aligned)  # another model cannot change this policy
+            os.environ["MINISGL_QWEN4_SGLANG_NUMERICS"] = "1"
+            with self.assertRaises(ValueError):
+                Qwen4RuntimeConfig.from_env().resolve(torch.device("cpu"))
 
-        original = qwen4_fast.SGLANG_NUMERICS
-        try:
-            with (
-                patch.dict(os.environ, {}, clear=False),
-                patch.object(qwen4_fast, "ENABLED", True),
-                patch("torch.cuda.get_device_capability", return_value=(10, 0)),
-                patch("torch.version.cuda", "13.0"),
-            ):
-                os.environ.pop("MINISGL_QWEN4_SGLANG_NUMERICS", None)
-                qwen4_fast.configure_numerics(torch.device("cuda"))
-                self.assertTrue(qwen4_fast.SGLANG_NUMERICS)
-                os.environ["MINISGL_QWEN4_SGLANG_NUMERICS"] = "0"
-                qwen4_fast.configure_numerics(torch.device("cuda"))
-                self.assertFalse(qwen4_fast.SGLANG_NUMERICS)
-                os.environ["MINISGL_QWEN4_SGLANG_NUMERICS"] = "1"
-                with self.assertRaises(ValueError):
-                    qwen4_fast.configure_numerics(torch.device("cpu"))
-        finally:
-            qwen4_fast.SGLANG_NUMERICS = original
+    def test_reference_and_unsupported_device(self):
+        with patch.dict(os.environ, {"MINISGL_QWEN4_REFERENCE": "1"}, clear=True):
+            reference = Qwen4RuntimeConfig.from_env().resolve(torch.device("cpu"))
+        self.assertFalse(reference.enabled())
+        self.assertFalse(reference.aligned)
+        with (
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+            patch("torch.version.cuda", "13.0"),
+        ):
+            legacy = Qwen4RuntimeConfig().resolve(torch.device("cuda"))
+        self.assertTrue(legacy.enabled())
+        self.assertFalse(legacy.aligned)
+
+    def test_policy_is_frozen_and_env_read_does_not_initialize_cuda(self):
+        from dataclasses import FrozenInstanceError
+
+        with patch("torch.cuda.get_device_capability", side_effect=AssertionError("CUDA queried")):
+            policy = Qwen4RuntimeConfig.from_env()
+        with self.assertRaises(FrozenInstanceError):
+            policy.aligned = False
+        with patch.dict(os.environ, {"MINISGL_QWEN4_SGLANG_NUMERICS": "invalid"}):
+            with self.assertRaises(ValueError):
+                Qwen4RuntimeConfig.from_env()
+
+    def test_backend_policies_are_independent(self):
+        from minisgl.attention.qwen4 import Qwen4Backend
+
+        first = Qwen4Backend(SimpleNamespace(qwen4_runtime=Qwen4RuntimeConfig(aligned=True)))
+        second = Qwen4Backend(SimpleNamespace(qwen4_runtime=Qwen4RuntimeConfig(aligned=False)))
+        self.assertTrue(first.runtime.aligned)
+        self.assertFalse(second.runtime.aligned)
+        with self.assertRaises(ValueError):
+            Qwen4Backend(SimpleNamespace(qwen4_runtime=Qwen4RuntimeConfig()))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -68,7 +101,7 @@ class TestSGLangNumerics(unittest.TestCase):
 
         for rows in (1, 5, 128, 2053):
             x = self.tensor(rows, 8, 128)
-            torch.testing.assert_close(mini.l2(x), l2norm_fwd(x), atol=0, rtol=0)
+            torch.testing.assert_close(oracle.l2(x), l2norm_fwd(x), atol=0, rtol=0)
 
     def test_ple_decode_gate_conv_and_padding(self):
         import torch.nn.functional as F
@@ -286,12 +319,11 @@ class TestSGLangNumerics(unittest.TestCase):
 
     def test_qsa_index_compaction(self):
         from minisgl.attention.qwen4 import Qwen4Backend
-        from minisgl.models import qwen4_fast
 
         selected = torch.arange(8, device="cuda").repeat(5, 1)
         lengths = torch.tensor([1, 3, 4, 7, 19], device="cuda")
-        with patch.object(qwen4_fast, "SGLANG_NUMERICS", True):
-            indices = Qwen4Backend.expand(selected, lengths // 4, lengths, None, 4)
+        backend = Qwen4Backend(SimpleNamespace(qwen4_runtime=Qwen4RuntimeConfig(aligned=True)))
+        indices = backend.expand(selected, lengths // 4, lengths, None, 4)
         for row, length in enumerate(lengths.tolist()):
             torch.testing.assert_close(
                 indices[row, :length], torch.arange(length, device="cuda", dtype=torch.int32)
@@ -316,8 +348,8 @@ class TestSGLangNumerics(unittest.TestCase):
         # Below budget the score GEMM is skipped, but every visible block is
         # retained; above budget the independent oracle chooses the same IDs.
         torch.testing.assert_close(
-            mini.index_topk_deterministic(actual, counts),
-            mini.index_topk_deterministic(expected, counts),
+            oracle.index_topk_deterministic(actual, counts),
+            oracle.index_topk_deterministic(expected, counts),
             atol=0,
             rtol=0,
         )
@@ -337,7 +369,7 @@ class TestSGLangNumerics(unittest.TestCase):
         scores = torch.rand((5, 1024), device="cuda", dtype=torch.float32)
         scores[:, 400:] = 0.0
         lengths = torch.tensor([0, 7, 512, 513, 1024], device="cuda", dtype=torch.int32)
-        got = mini.index_topk_deterministic(scores, lengths)
+        got = oracle.index_topk_deterministic(scores, lengths)
         for row, length in enumerate(lengths.tolist()):
             expected = (
                 scores[row, :length].argsort(descending=True, stable=True)[:512].sort().values
@@ -472,7 +504,7 @@ class TestSGLangNumerics(unittest.TestCase):
 
     @torch.inference_mode()
     def test_gdn_model_path(self):
-        from minisgl.models.qwen4_optimized import FastGDN
+        from minisgl.models.qwen4 import GatedDeltaNet
 
         pool = SimpleNamespace(
             recurrent={0: torch.zeros(4, 24, 128, 128, device="cuda")},
@@ -501,12 +533,12 @@ class TestSGLangNumerics(unittest.TestCase):
             eps=1e-6,
             out_proj=SimpleNamespace(forward=lambda x: x),
         )
-        with patch("minisgl.models.qwen4_optimized.get_global_ctx", return_value=ctx):
-            out = FastGDN.forward_sglang(op, self.tensor(5, 32))
+        with patch("minisgl.models.qwen4.get_global_ctx", return_value=ctx):
+            out = GatedDeltaNet.forward_aligned(op, self.tensor(5, 32))
             self.assertEqual(out.shape, (5, 3072))
             self.assertTrue(torch.isfinite(out).all())
             batch.is_decode = True
-            out = FastGDN.forward_sglang(op, self.tensor(1, 32))
+            out = GatedDeltaNet.forward_aligned(op, self.tensor(1, 32))
             self.assertEqual(out.shape, (1, 3072))
             self.assertTrue(torch.isfinite(out).all())
         self.assertEqual(pool.recurrent[0][0].abs().max().item(), 0)

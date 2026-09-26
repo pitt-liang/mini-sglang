@@ -24,7 +24,7 @@ The sibling JIT source `../csrc/jit/qwen4_topk.cu` adapts
 under the included Apache-2.0 license. Its radix algorithm is unchanged;
 the host wrapper uses mini's launch utilities and disables PDL scheduling.
 
-The sibling `../qwen4_sglang.py` and `../csrc/jit/qwen4_hc.cu` reproduce the
+The sibling `../qwen4_ops.py` and `../csrc/jit/qwen4_hc.cu` reproduce the
 pinned SGLang HC, MoE, GDN output, QSA index normalization and PLE numerical
 contracts. In particular, PLE gate-value arithmetic follows
 `kernels/ops/qwen4_ple.py`; the decode state mover is adapted to mini's explicit

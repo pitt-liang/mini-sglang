@@ -150,6 +150,9 @@ the reference path; set `MINISGL_QWEN4_REFERENCE=1` and pass
 A GB200 numerical-alignment path is enabled by default on SM100/CUDA 13+.
 `MINISGL_QWEN4_SGLANG_NUMERICS=1` requires it explicitly; `=0` selects the older
 fast path. This is separate from the older mini reference switch.
+These switches are read into an immutable per-model policy at configuration time
+and resolved on the worker's device before model construction and weight packing;
+changing the environment afterwards does not switch an existing model or graph.
 Alignment targets Torch dense GEMM, Triton MoE and FP32 recurrent state; stock
 sparse top-k tie ordering is nondeterministic. This does not imply performance
 parity or bit-exact outputs for every SGLang backend.
@@ -170,6 +173,35 @@ Set `QWEN4_MODEL` to a local checkpoint and `QWEN4_HF_SOURCE` to an independent
 Transformers `modeling_qwen4_exp.py` to enable their optional reference checks.
 SGLang operator parity tests skip when the reference framework is unavailable;
 it is not required in the production environment.
+
+The implementation keeps model structure and eager/legacy/aligned dispatch in
+`models/qwen4.py`, loading and packing in `models/qwen4_weight.py`, and GPU
+operators in `kernel/qwen4_ops.py` (older numerics use the `legacy_` prefix).
+`models/qwen4_ops.py` contains Torch reference helpers; GDN recurrence, sparse QSA,
+attention metadata and cache storage retain their separate modules. Test-only
+deterministic top-k and L2 helpers live under `tests/models`, not the runtime.
+
+Without pytest, run the Qwen4 unit tests using the project environment:
+
+```bash
+.venv/bin/python -m unittest discover -s tests/models -p 'test_qwen4*.py' -v
+```
+
+For a real-weight TP2 smoke test on two GB200 GPUs:
+
+```bash
+smoke_dir=$(mktemp -d /tmp/minisgl-qwen4-smoke.XXXXXX)
+MINISGL_QWEN4_REFERENCE=0 MINISGL_QWEN4_SGLANG_NUMERICS=1 \
+MINISGL_QWEN4_MNNVL=1 OMP_NUM_THREADS=4 \
+  .venv/bin/torchrun --standalone --nproc-per-node=2 tests/models/smoke_qwen4.py \
+  --model /path/to/Qwen3.8-Flash-Next --output "$smoke_dir/current"
+```
+
+This checks finite logits, eager/graph equality, padded batches, repeated decode,
+chunked scheduler prefill, cancellation and slot recycling. It uses controlled
+top-k ordering to isolate regressions, not to certify stock-top-k determinism or
+performance. Use `--compare /path/to/baseline-prefix` to require exact logits
+against captures from a separate run; captures belong outside the repository.
 
 ### 4. Interactive Shell
 

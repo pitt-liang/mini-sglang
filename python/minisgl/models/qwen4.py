@@ -1,6 +1,7 @@
 """Native BF16 text path for Qwen3.8-Flash-Next (Qwen4Exp).
 
-Eager/reference and native graph decode, GPU-resident PLE, TP sharding.
+Explicit per-model execution policy, native graph decode, GPU-resident PLE and TP.
+Each layer owns its eager/legacy/aligned forwards; classes are never replaced.
 Visual inputs, MTP, quantization and prefix snapshots are not enabled.
 """
 
@@ -10,6 +11,13 @@ import torch
 import torch.nn.functional as F
 from minisgl.core import get_global_ctx
 from minisgl.distributed import get_tp_info
+from minisgl.kernel import qwen4_ops as ops
+from minisgl.kernel.qwen4 import (
+    can_chunk_prefill,
+    gated_delta_decode,
+    prefill_delta,
+    prefill_delta_pool,
+)
 from minisgl.layers import BaseOP, LinearColParallelMerged, LinearOProj, LinearReplicated, MoELayer
 from minisgl.layers.base import OPList
 from minisgl.layers.embedding import ParallelLMHead, VocabParallelEmbedding
@@ -36,6 +44,7 @@ class NarrowLinear(LinearReplicated):
 
 class GatedResidual(BaseOP):
     def __init__(self, config, combine=True):
+        self.runtime = config.qwen4_runtime
         self.h, self.n = config.hidden_size, config.hybrid["hc_count"]
         self.eps = config.rms_norm_eps
         width = self.h * self.n
@@ -44,7 +53,7 @@ class GatedResidual(BaseOP):
         self.input_mix_weight_up = LinearReplicated(config.hybrid["hc_lowrank"], width, False)
         self.block_inject_weight = NarrowLinear(width, self.n, False) if combine else None
 
-    def forward(self, residual):
+    def _forward_eager(self, residual):
         norm = rms_norm(residual, self.hc_norm.weight, self.eps, self.h)
         gate = F.silu(self.input_mix_weight_down.forward(norm) / self.n)
         gate = self.input_mix_weight_up.forward(gate).sigmoid()
@@ -56,14 +65,61 @@ class GatedResidual(BaseOP):
         )
         return mixed, injection
 
-    def combine(self, residual, output, injection):
+    def _combine_eager(self, residual, output, injection):
         return (residual.view(-1, self.n, self.h) + injection[..., None] * output[:, None]).flatten(
             1
         )
 
+    def forward(self, residual):
+        if not self.runtime.enabled(residual):
+            return self._forward_eager(residual)
+        if self.runtime.aligned:
+            normed = ops.grouped_norm(residual, self.hc_norm.weight, self.h, self.eps)
+            if normed.shape[0] <= 24:
+                if hasattr(self, "_sg_up"):
+                    from minisgl.kernel._qwen4_cute.hc_mix import hc_mix
+
+                    mixed = hc_mix(
+                        normed, self.input_mix_weight_down.weight, self._sg_up, self.n, self.h
+                    )
+                else:
+                    mixed = ops.gr_project_mix(
+                        normed,
+                        self.input_mix_weight_down.weight,
+                        self.input_mix_weight_up.weight,
+                        self.n,
+                    )
+            else:
+                mixed = ops.gr_project_mix_large(
+                    normed,
+                    self.input_mix_weight_down.weight,
+                    self.input_mix_weight_up.weight,
+                    self.n,
+                    self.h,
+                )
+            return mixed, normed
+        normed = ops.legacy_norm(residual, self.hc_norm.weight, self.eps, self.h)
+        if normed.shape[0] <= 16 and normed.shape[1] % 2048 == 0:
+            mixed = ops.legacy_gr_project_mix(
+                normed, self.input_mix_weight_down.weight, self.input_mix_weight_up.weight, self.n
+            )
+        else:
+            gate = ops.legacy_silu_div(self.input_mix_weight_down.forward(normed), self.n)
+            gate = self.input_mix_weight_up.forward(gate)
+            mixed = ops.legacy_gr_mix(gate, normed, self.n)
+        return mixed, normed
+
+    def combine(self, residual, output, injection):
+        if not self.runtime.enabled(residual):
+            return self._combine_eager(residual, output, injection)
+        if self.runtime.aligned:
+            return ops.gr_combine(residual, output, injection, self.block_inject_weight.weight)
+        return ops.legacy_gr_combine(residual, output, injection, self.block_inject_weight.weight)
+
 
 class GatedDeltaNet(BaseOP):
     def __init__(self, config, layer_id):
+        self.runtime = config.qwen4_runtime
         c, tp = config.hybrid, get_tp_info().size
         h = config.hidden_size
         self.hk, self.hv = c["linear_num_key_heads"] // tp, c["linear_num_value_heads"] // tp
@@ -80,7 +136,7 @@ class GatedDeltaNet(BaseOP):
         self.norm = Weight(self.dv)
         self.out_proj = LinearOProj(vd, h, False)
 
-    def forward(self, x):
+    def _forward_eager(self, x):
         from minisgl.kernel.qwen4 import gated_delta_rule
 
         ctx = get_global_ctx()
@@ -113,6 +169,150 @@ class GatedDeltaNet(BaseOP):
         y = (y.float() * z.float().sigmoid()).to(x.dtype)
         return self.out_proj.forward(y.flatten(1))
 
+    def forward(self, x):
+        if not self.runtime.enabled(x):
+            return self._forward_eager(x)
+        if self.runtime.aligned:
+            return self.forward_aligned(x)
+        ctx = get_global_ctx()
+        qkv, z, a, b = F.linear(x, self._packed).split(self._widths, -1)
+        qkv = qkv.contiguous()
+        z = z.reshape(-1, self.hv, self.dv).contiguous()
+        decay, beta = ops.legacy_gdn_gates(a, b, self.A_log, self.dt_bias)
+        kd, vd = self.hk * self.dk, self.hv * self.dv
+        m = ctx.batch.attn_metadata
+        if ctx.batch.is_decode:
+            mixed = ops.legacy_conv_decode(
+                qkv, self.conv1d.weight, ctx.kv_cache.conv[self.layer_id], m.slots, m.valid
+            )
+            q, k, v = mixed.split((kd, kd, vd), -1)
+            q, k = [ops.legacy_l2(t.reshape(-1, self.hk, self.dk)) for t in (q, k)]
+            output = gated_delta_decode(
+                q,
+                k,
+                v.reshape(-1, self.hv, self.dv),
+                decay,
+                beta,
+                ctx.kv_cache.recurrent[self.layer_id],
+                m.slots,
+                m.valid,
+            )
+        elif can_chunk_prefill(qkv):
+            mixed = torch.empty_like(qkv)
+            for slot, _, _, a, b in m.spans:
+                mixed[a:b] = causal_conv(
+                    qkv[a:b], self.conv1d.weight, ctx.kv_cache.conv[self.layer_id][slot]
+                )
+            q, k, v = mixed.split((kd, kd, vd), -1)
+            q, k = [ops.legacy_l2(t.reshape(-1, self.hk, self.dk)) for t in (q, k)]
+            output = prefill_delta_pool(
+                q,
+                k,
+                v.reshape(-1, self.hv, self.dv),
+                decay,
+                beta,
+                ctx.kv_cache.recurrent[self.layer_id],
+                m.slots,
+                m.cu_seqlens,
+            )
+        else:
+            output = torch.empty_like(z)
+            for slot, _, _, a, b in m.spans:
+                mixed = causal_conv(
+                    qkv[a:b], self.conv1d.weight, ctx.kv_cache.conv[self.layer_id][slot]
+                )
+                q, k, v = mixed.split((kd, kd, vd), -1)
+                q, k = [ops.legacy_l2(t.reshape(-1, self.hk, self.dk)) for t in (q, k)]
+                output[a:b] = prefill_delta(
+                    q,
+                    k,
+                    v.reshape(-1, self.hv, self.dv),
+                    decay[a:b],
+                    beta[a:b],
+                    ctx.kv_cache.recurrent[self.layer_id][slot],
+                )
+        y = ops.legacy_gdn_output(output, z, self.norm.weight, self.eps)
+        return self.out_proj.forward(y.flatten(1))
+
+    def forward_aligned(self, x):
+        from minisgl.kernel._qwen4_fla.causal_conv import causal_conv1d_fn, causal_conv1d_update
+        from minisgl.kernel._qwen4_fla.chunk import chunk_gated_delta_rule
+        from minisgl.kernel._qwen4_fla.fused_gdn_gating import fused_gdn_gating
+        from minisgl.kernel._qwen4_fla.packed_decode import (
+            fused_recurrent_gated_delta_rule_packed_decode,
+        )
+
+        ctx = get_global_ctx()
+        m, pool = ctx.batch.attn_metadata, ctx.kv_cache
+        # SGLang packs QKV/Z/B/A, and uses two GEMMs beyond 1024 tokens.
+        if x.shape[0] <= 1024:
+            projected = F.linear(x, self._packed)
+        else:
+            cut = self._widths[0] + self._widths[1]
+            projected = torch.cat(
+                (F.linear(x, self._packed[:cut]), F.linear(x, self._packed[cut:])), -1
+            )
+        qkv, z, b, a = projected.split(self._widths, -1)
+        z = z.reshape(-1, self.hv, self.dv)
+        state = pool.recurrent[self.layer_id]
+        weight = self.conv1d.weight[:, 0]
+        if ctx.batch.is_decode:
+            slots = torch.where(m.valid, m.slots, -1)
+            mixed = causal_conv1d_update(
+                qkv.contiguous(),
+                pool.conv[self.layer_id],
+                weight,
+                activation="silu",
+                conv_state_indices=slots,
+            )
+            output = torch.empty((x.shape[0], 1, self.hv, self.dv), device=x.device, dtype=x.dtype)
+            fused_recurrent_gated_delta_rule_packed_decode(
+                mixed,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                self.dk**-0.5,
+                state,
+                output,
+                slots,
+                use_qk_l2norm_in_kernel=True,
+            )
+            output = output[:, 0]
+        else:
+            initial = torch.tensor(
+                [cached > 0 for _, cached, _, _, _ in m.spans], device=x.device, dtype=torch.bool
+            )
+            mixed = causal_conv1d_fn(
+                qkv.T,
+                weight,
+                None,
+                conv_states=pool.conv[self.layer_id],
+                has_initial_state=initial,
+                cache_indices=m.slots,
+                query_start_loc=m.cu_seqlens,
+                seq_lens_cpu=[end - start for _, _, _, start, end in m.spans],
+                activation="silu",
+            ).T
+            kd, vd = self.hk * self.dk, self.hv * self.dv
+            q, k, v = mixed.split((kd, kd, vd), -1)
+            g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+            output, _, _ = chunk_gated_delta_rule(
+                q.reshape(1, -1, self.hk, self.dk),
+                k.reshape(1, -1, self.hk, self.dk),
+                v.reshape(1, -1, self.hv, self.dv),
+                g,
+                beta,
+                initial_state=state,
+                initial_state_indices=m.slots,
+                cu_seqlens=m.cu_seqlens,
+                use_qk_l2norm_in_kernel=True,
+            )
+            output = output[0]
+        return self.out_proj.forward(
+            ops.gdn_output(output, z, self.norm.weight, self.eps).flatten(1)
+        )
+
 
 class QSAIndexer(BaseOP):
     def __init__(self, config):
@@ -126,6 +326,7 @@ class QSAIndexer(BaseOP):
 
 class QSAAttention(BaseOP):
     def __init__(self, config, layer_id):
+        self.runtime = config.qwen4_runtime
         tp = get_tp_info().size
         self.config, self.layer_id = config, layer_id
         self.hq, self.hkv, self.dim = (
@@ -141,7 +342,7 @@ class QSAAttention(BaseOP):
         self.o_proj = LinearOProj(config.num_qo_heads * d, h, False)
         self.indexer = QSAIndexer(config)
 
-    def forward(self, x):
+    def _forward_eager(self, x):
         ctx, rc = get_global_ctx(), self.config.rotary_config
         positions = ctx.batch.positions
         q, gate = self.q_proj.forward(x).view(-1, self.hq, 2 * self.dim).chunk(2, -1)
@@ -172,6 +373,48 @@ class QSAAttention(BaseOP):
         out = ctx.attn_backend.qsa(q, k, v, iq, ik, indexer.k_layernorm.weight, self.layer_id)
         return self.o_proj.forward((out * gate.sigmoid()).flatten(1))
 
+    def forward(self, x):
+        if not self.runtime.enabled(x):
+            return self._forward_eager(x)
+        ctx, rc = get_global_ctx(), self.config.rotary_config
+        pos = ctx.batch.positions
+        if self.runtime.aligned:
+            cut = sum(self._widths[:3])
+            qg, k, v = F.linear(x, self._packed[:cut]).split(self._widths[:3], -1)
+            iqk = F.linear(x, self._packed[cut:])
+        else:
+            qg, k, v, iqk = F.linear(x, self._packed).split(self._widths, -1)
+        q, gate = qg.reshape(-1, self.hq, 2 * self.dim).chunk(2, -1)
+        k = k.reshape(-1, self.hkv, self.dim)
+        v = v.reshape(-1, self.hkv, self.dim).contiguous()
+        kwargs = {
+            "eps": self.config.rms_norm_eps,
+            "positions": pos,
+            "rotary_dim": rc.rotary_dim,
+            "base": rc.base,
+        }
+
+        def norm(t, w):
+            if self.runtime.aligned:
+                return ops.norm_rope(t, w, pos, self._rope_cache, self.config.rms_norm_eps)
+            return ops.legacy_norm(t, w, **kwargs)
+
+        q = norm(q, self.q_norm.weight)
+        k = norm(k, self.k_norm.weight)
+        ix = self.indexer
+        iq, ik = iqk.split((ix.heads * ix.dim, ix.dim), -1)
+        iq = iq.view(-1, ix.heads, ix.dim)
+        if self.runtime.aligned:
+            iq = ops.index_norm_rope(
+                iq, ix.q_layernorm.weight, pos, self._rope_cache, self.config.rms_norm_eps
+            )
+        else:
+            iq = norm(iq, ix.q_layernorm.weight)
+        out = ctx.attn_backend.qsa(q, k, v, iq, ik, ix.k_layernorm.weight, self.layer_id)
+        if self.runtime.aligned:
+            return self.o_proj.forward(ops.sigmoid_mul(out, gate).flatten(1))
+        return self.o_proj.forward((out * gate.sigmoid()).flatten(1))
+
 
 class SharedMLP(BaseOP):
     def __init__(self, hidden, intermediate):
@@ -185,6 +428,7 @@ class SharedMLP(BaseOP):
 
 class SparseMoE(BaseOP):
     def __init__(self, config):
+        self.runtime = config.qwen4_runtime
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, False)
         self.experts = MoELayer(
             config.num_experts,
@@ -198,11 +442,44 @@ class SparseMoE(BaseOP):
         )
         self.shared_expert_gate = NarrowLinear(config.hidden_size, 1, False)
 
-    def forward(self, x):
+    def _forward_eager(self, x):
         # The existing fused MoE backend reuses x as its output buffer.
         shared = self.shared_expert.forward(x) * self.shared_expert_gate.forward(x).sigmoid()
         routed = self.experts.forward(x, self.gate.forward(x))
         return routed + shared
+
+    def forward(self, x):
+        if not self.runtime.enabled(x):
+            return self._forward_eager(x)
+        if self.runtime.aligned:
+            from minisgl.layers import silu_and_mul
+            from minisgl.moe.fused import fused_experts_impl
+
+            # The routed backend writes its result into its input buffer.
+            original = x.clone()
+            shared = silu_and_mul(F.linear(x, self._packed))
+            shared = F.linear(shared, self.shared_expert.down_proj.weight)
+            weights, ids = ops.router(self.gate.forward(x), self.experts.top_k)
+            routed = fused_experts_impl(
+                x, self.experts.gate_up_proj, self.experts.down_proj, weights, ids
+            )
+            output = ops.moe_combine(original, self.shared_expert_gate.weight, shared, routed)
+            return self.experts._comm.all_reduce(output) if get_tp_info().size > 1 else output
+        shared = self.shared_expert
+        y, gate = ops.legacy_shared_activation(
+            x, F.linear(x, self._packed), self.shared_expert_gate.weight
+        )
+        y = F.linear(y, shared.down_proj.weight)
+        # The routed implementation may overwrite x. Shared/gate must run first.
+        routed = self.experts.forward(x, self.gate.forward(x), reduce_results=False)
+        if get_tp_info().size > 1:
+            # Pack independent sums into one collective. Summing shared+routed
+            # before reduction changes BF16 rounding and can amplify MoE routing
+            # drift. Preserve the reference's two reduction results instead.
+            packed = self.experts._comm.all_reduce(torch.cat((routed, y), dim=-1))
+        else:
+            packed = torch.cat((routed, y), dim=-1)
+        return ops.legacy_moe_combine(packed, gate)
 
 
 class NGramTable(VocabParallelEmbedding):
@@ -239,6 +516,7 @@ class NGramEmbedding(BaseOP):
 
 class PLE(BaseOP):
     def __init__(self, config, layer_id):
+        self.runtime = config.qwen4_runtime
         c = config.hybrid
         self.layer_id, self.config = layer_id, config
         self.ple_embedding = NGramEmbedding(config, c["ple_layer_ids"].index(layer_id + 1))
@@ -248,7 +526,7 @@ class PLE(BaseOP):
         self.norm_key, self.norm_query, self.norm_conv = Weight(width), Weight(width), Weight(width)
         self.conv1d = Weight(width, 1, c["ple_conv_kernel_size"])
 
-    def forward(self, residual):
+    def _forward_eager(self, residual):
         ctx, cfg = get_global_ctx(), self.config
         c, pe = cfg.hybrid, self.ple_embedding
         ids = []
@@ -267,11 +545,10 @@ class PLE(BaseOP):
         hashed = torch.cat(ids)
         embeddings = pe.ngram_embedding.forward(hashed.flatten()).view(residual.shape[0], -1)
         h, n, eps = cfg.hidden_size, c["hc_count"], cfg.rms_norm_eps
-        from minisgl.models import qwen4_fast
 
         norm = rms_norm
-        if qwen4_fast.SGLANG_NUMERICS and qwen4_fast.enabled(residual):
-            from minisgl.kernel.qwen4_sglang import grouped_norm
+        if self.runtime.aligned and self.runtime.enabled(residual):
+            from minisgl.kernel.qwen4_ops import grouped_norm
 
             def norm(x, w, eps, h):
                 return grouped_norm(x, w, h, eps)
@@ -290,6 +567,51 @@ class PLE(BaseOP):
                 ctx.kv_cache.ple_conv[self.layer_id][slot],
                 c["ngram_size"],
             )
+        return value + out
+
+    def forward(self, residual):
+        ctx = get_global_ctx()
+        if not self.runtime.enabled(residual) or ctx.batch.is_prefill:
+            return self._forward_eager(residual)
+        cfg = self.config
+        c, pe, m = cfg.hybrid, self.ple_embedding, ctx.batch.attn_metadata
+        hashed = ops.hash_decode(
+            ctx.batch.input_ids,
+            ctx.kv_cache.ple_history[self.layer_id],
+            pe.layer_multipliers,
+            pe.ngram_heads_vocab_sizes,
+            pe.ngram_heads_offsets,
+            pe.heads,
+            c["eos_token_id"],
+            m.slots,
+            m.valid,
+        )
+        emb = pe.ngram_embedding.forward(hashed.flatten()).view(residual.shape[0], -1)
+        h, n, eps = cfg.hidden_size, c["hc_count"], cfg.rms_norm_eps
+
+        def norm(x, w):
+            if self.runtime.aligned:
+                return ops.grouped_norm(x, w, h, eps)
+            return ops.legacy_norm(x, w, eps, h)
+
+        key = norm(self.key_proj.forward(emb), self.norm_key.weight).view(-1, n, h)
+        query = norm(residual, self.norm_query.weight).view(-1, n, h)
+        gate = (key * query).sum(-1, keepdim=True) / math.sqrt(h)
+        if self.runtime.aligned:
+            value = ops.ple_gate_value(gate, self.value_proj.forward(emb))
+        else:
+            gate = gate.sign() * gate.abs().clamp_min(1e-6).sqrt()
+            value = (gate.sigmoid() * self.value_proj.forward(emb)[:, None]).flatten(1)
+        normed = norm(value, self.norm_conv.weight)
+        conv = ops.ple_conv_decode if self.runtime.aligned else ops.legacy_conv_decode
+        out = conv(
+            normed,
+            self.conv1d.weight,
+            ctx.kv_cache.ple_conv[self.layer_id],
+            m.slots,
+            m.valid,
+            c["ngram_size"],
+        )
         return value + out
 
 
@@ -325,6 +647,9 @@ class Qwen4Text(BaseOP):
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
     def __init__(self, config):
+        self.runtime = config.qwen4_runtime
+        if self.runtime.aligned is None:
+            raise ValueError("Resolve Qwen4RuntimeConfig on the target device before construction")
         tp = get_tp_info().size
         c = config.hybrid
         for heads in (
@@ -342,17 +667,12 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         self.config = config
         self.model = Qwen4Text(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-        from .qwen4_optimized import install
-
-        install(self)
 
     def load_weights(self, model_path, device):
-        from .qwen4_weight import load_qwen4_weights
+        from .qwen4_weight import load_qwen4_weights, pack_qwen4_weights
 
         load_qwen4_weights(self, model_path, device)
-        from .qwen4_optimized import pack_weights
-
-        pack_weights(self)
+        pack_qwen4_weights(self)
 
     def forward(self):
         ctx = get_global_ctx()

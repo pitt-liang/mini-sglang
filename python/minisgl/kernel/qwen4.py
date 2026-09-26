@@ -140,3 +140,53 @@ def gated_delta_decode(q, k, v, log_decay, beta, state_pool, slots, valid):
         num_warps=4,
     )
     return out
+
+
+def can_chunk_prefill(q):
+    return (
+        q.shape[0] >= 128
+        and torch.version.cuda is not None
+        and int(torch.version.cuda.split(".")[0]) >= 13
+        and torch.cuda.get_device_capability(q.device)[0] == 10
+    )
+
+
+def prefill_delta_pool(q, k, v, log_decay, beta, state, slots, cu_seqlens):
+    from flashinfer.gdn_prefill import chunk_gated_delta_rule
+
+    output, _ = chunk_gated_delta_rule(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        log_decay.exp().contiguous(),
+        beta.float().contiguous(),
+        initial_state=state,
+        output_state=state,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=False,
+        state_indices=slots,
+        cu_seqlens=cu_seqlens,
+    )
+    return output
+
+
+def prefill_delta(q, k, v, log_decay, beta, state):
+    # Blackwell's chunked kernel needs CUDA 13; the original cu128 deployment
+    # and short chunks keep the portable native recurrence. State stays FP32.
+    if can_chunk_prefill(q):
+        from flashinfer.gdn_prefill import chunk_gated_delta_rule
+
+        output, _ = chunk_gated_delta_rule(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            log_decay.exp().contiguous(),
+            beta.float().contiguous(),
+            initial_state=state[None],
+            output_state=state[None],
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=torch.tensor([0, q.shape[0]], dtype=torch.int32, device=q.device),
+        )
+        return output
+    return gated_delta_rule(q, k, v, log_decay, beta, state)

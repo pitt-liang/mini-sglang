@@ -3,9 +3,10 @@
 import unittest
 
 import torch
-from minisgl.kernel import qwen4_fused as fast
+from minisgl.kernel import qwen4_ops as fast
 from minisgl.kernel.qwen4 import gated_delta_decode, gated_delta_rule
 from minisgl.models import qwen4_ops as ref
+from minisgl.models.config import Qwen4RuntimeConfig
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -22,12 +23,12 @@ class FastTests(unittest.TestCase):
             w = self.tensor(d) * 0.1
             p = torch.tensor([0, 3, 2048, 8191, 131071], device="cuda")
             expected = ref.rotary(ref.rms_norm(x, w), p, rd, 10000000.0)
-            actual = fast.norm(x, w, positions=p, rotary_dim=rd, base=10000000)
+            actual = fast.legacy_norm(x, w, positions=p, rotary_dim=rd, base=10000000)
             torch.testing.assert_close(actual, expected, atol=0.032, rtol=0.02)
         x = self.tensor(7, 10240)
         w = self.tensor(10240) * 0.1
         torch.testing.assert_close(
-            fast.norm(x, w, group_size=2560),
+            fast.legacy_norm(x, w, group_size=2560),
             ref.rms_norm(x, w, group_size=2560),
             atol=0.016,
             rtol=0.01,
@@ -36,11 +37,13 @@ class FastTests(unittest.TestCase):
     def test_gr(self):
         from types import SimpleNamespace
 
-        from minisgl.models.qwen4_exp import GatedResidual
-        from minisgl.models.qwen4_optimized import FastGR
+        from minisgl.models.qwen4 import GatedResidual
 
         cfg = SimpleNamespace(
-            hidden_size=2560, hybrid={"hc_count": 4, "hc_lowrank": 320}, rms_norm_eps=1e-6
+            qwen4_runtime=Qwen4RuntimeConfig(aligned=False),
+            hidden_size=2560,
+            hybrid={"hc_count": 4, "hc_lowrank": 320},
+            rms_norm_eps=1e-6,
         )
         op = GatedResidual(cfg)
         for obj in [
@@ -51,9 +54,8 @@ class FastTests(unittest.TestCase):
         ]:
             obj.weight = self.tensor(*obj.weight.shape) * 0.01
         x, y = self.tensor(4, 10240), self.tensor(4, 2560)
-        mixed, gate = op.forward(x)
-        expected = op.combine(x, y, gate)
-        op.__class__ = FastGR
+        mixed, gate = op._forward_eager(x)
+        expected = op._combine_eager(x, y, gate)
         actual, norm = op.forward(x)
         torch.testing.assert_close(actual, mixed, atol=0.008, rtol=0.02)
         torch.testing.assert_close(op.combine(x, y, norm), expected, atol=0.032, rtol=0.02)
@@ -108,7 +110,7 @@ class FastTests(unittest.TestCase):
             ys = []
             for row, slot in enumerate([2, 0]):
                 ys.append(ref.causal_conv(x[row : row + 1], w, expected[slot], dil))
-            actual = fast.conv_decode(x, w, hist, slots, valid, dil)
+            actual = fast.legacy_conv_decode(x, w, hist, slots, valid, dil)
             torch.testing.assert_close(actual[:2], torch.cat(ys), atol=0.063, rtol=0.02)
             torch.testing.assert_close(hist, expected, atol=0, rtol=0)
             self.assertEqual(actual[2:].count_nonzero().item(), 0)
@@ -183,7 +185,7 @@ class FastTests(unittest.TestCase):
         import torch.nn.functional as F
 
         x, gu, w = self.tensor(4, 2560), self.tensor(4, 640), self.tensor(1, 2560) * 0.01
-        a, gate = fast.shared_activation(x, gu, w)
+        a, gate = fast.legacy_shared_activation(x, gu, w)
         g, u = gu.chunk(2, -1)
         torch.testing.assert_close(a, F.silu(g) * u, atol=0.016, rtol=0.01)
         torch.testing.assert_close(
@@ -191,7 +193,9 @@ class FastTests(unittest.TestCase):
         )
         packed = self.tensor(4, 5120)
         r, s = packed.chunk(2, -1)
-        torch.testing.assert_close(fast.moe_combine(packed, gate), r + s * gate, atol=0, rtol=0)
+        torch.testing.assert_close(
+            fast.legacy_moe_combine(packed, gate), r + s * gate, atol=0, rtol=0
+        )
 
     def test_moe_decode_launch_bound(self):
         from unittest.mock import patch
@@ -217,7 +221,7 @@ class FastTests(unittest.TestCase):
             or torch.cuda.get_device_capability()[0] != 10
         ):
             self.skipTest("FlashInfer Blackwell chunk prefill requires CUDA 13")
-        from minisgl.models.qwen4_optimized import prefill_delta
+        from minisgl.kernel.qwen4 import prefill_delta
 
         q, k = [ref.l2_norm(self.tensor(129, 8, 128)) for _ in range(2)]
         v = self.tensor(129, 24, 128)
@@ -237,7 +241,7 @@ class FastTests(unittest.TestCase):
             or torch.cuda.get_device_capability()[0] != 10
         ):
             self.skipTest("FlashInfer Blackwell chunk prefill requires CUDA 13")
-        from minisgl.models.qwen4_optimized import prefill_delta_pool
+        from minisgl.kernel.qwen4 import prefill_delta_pool
 
         q, k = [ref.l2_norm(self.tensor(256, 8, 128)) for _ in range(2)]
         v = self.tensor(256, 24, 128)
@@ -264,7 +268,7 @@ class FastTests(unittest.TestCase):
         packed = self.tensor(4, 8240)
         a, b = packed[:, -48:-24], packed[:, -24:]
         log, dt = torch.randn(24, device="cuda"), torch.randn(24, device="cuda")
-        g, beta = fast.gdn_gates(a, b, log, dt)
+        g, beta = fast.legacy_gdn_gates(a, b, log, dt)
         torch.testing.assert_close(g, -log.exp() * F.softplus(a.float() + dt), atol=2e-6, rtol=1e-6)
         torch.testing.assert_close(beta, b.sigmoid(), atol=0, rtol=0)
 

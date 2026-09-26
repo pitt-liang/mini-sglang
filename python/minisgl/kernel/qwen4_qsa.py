@@ -406,7 +406,7 @@ def compress_decode(
     rope_cache=None,
 ):
     if rope_cache is not None:
-        from minisgl.kernel.qwen4_sglang import index_norm_rope
+        from minisgl.kernel.qwen4_ops import index_norm_rope
 
         # Compression must use the indexer's CUDA warp reduction, not the
         # different Triton tree used by the legacy fused decode kernel.

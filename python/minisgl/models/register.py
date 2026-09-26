@@ -3,8 +3,8 @@ import importlib
 from .config import ModelConfig
 
 _MODEL_REGISTRY = {
-    "Qwen4ExpForConditionalGeneration": (".qwen4_exp", "Qwen4ExpForCausalLM"),
-    "Qwen4ExpForCausalLM": (".qwen4_exp", "Qwen4ExpForCausalLM"),
+    "Qwen4ExpForConditionalGeneration": (".qwen4", "Qwen4ExpForCausalLM"),
+    "Qwen4ExpForCausalLM": (".qwen4", "Qwen4ExpForCausalLM"),
     "LlamaForCausalLM": (".llama", "LlamaForCausalLM"),
     "Qwen2ForCausalLM": (".qwen2", "Qwen2ForCausalLM"),
     "Qwen3ForCausalLM": (".qwen3", "Qwen3ForCausalLM"),

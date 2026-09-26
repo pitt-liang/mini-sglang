@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from datetime import timedelta
 from typing import Any, Dict, NamedTuple, Tuple
 
@@ -35,6 +36,16 @@ class Engine:
 
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
         torch.cuda.set_device(self.device)
+        if config.model_config.is_qwen4:
+            model_config = config.model_config
+            object.__setattr__(
+                config,
+                "model_config",
+                replace(
+                    model_config,
+                    qwen4_runtime=model_config.qwen4_runtime.resolve(self.device),
+                ),
+            )
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
@@ -258,11 +269,11 @@ def _adjust_config(config: EngineConfig):
         object.__setattr__(config, attr, value)
 
     if config.model_config.is_qwen4:
-        from minisgl.models import qwen4_fast
+        runtime = config.model_config.qwen4_runtime
 
         if config.attention_backend not in ("auto", "qwen4"):
             raise ValueError("Qwen4 requires the qwen4 hybrid attention backend")
-        if not qwen4_fast.enabled() and (
+        if not runtime.enabled() and (
             config.cuda_graph_max_bs not in (None, 0) or config.cuda_graph_bs
         ):
             raise ValueError("Qwen4 eager baseline does not support CUDA graphs")
@@ -270,7 +281,7 @@ def _adjust_config(config: EngineConfig):
             raise ValueError("Qwen4 currently supports BF16 weights only")
         override("attention_backend", "qwen4")
         if config.cuda_graph_max_bs is None and not config.cuda_graph_bs:
-            override("cuda_graph_max_bs", 4 if qwen4_fast.enabled() else 0)
+            override("cuda_graph_max_bs", 4 if runtime.enabled() else 0)
         if config.page_size == 1:
             override("page_size", config.model_config.hybrid["indexer_compress_ratio"])
         if hasattr(config, "cache_type"):

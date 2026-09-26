@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 from minisgl.distributed import get_tp_info
+from minisgl.kernel import qwen4_ops as ops
 from minisgl.layers.base import BaseOP, OPList
 from minisgl.layers.embedding import VocabParallelEmbedding
 from minisgl.layers.linear import LinearColParallelMerged, LinearOProj
@@ -133,3 +134,45 @@ def load_qwen4_weights(model, model_path, device):
     logger.info_rank0(
         f"Qwen4 text weights loaded; {len(used)} checkpoint tensors validated (vision/MTP excluded)"
     )
+
+
+def pack_qwen4_weights(model):
+    """One allocation per merged projection; original parameter names stay views.
+
+    Called after checkpoint validation, before graph capture. No permanent copy
+    of the original matrices is retained, and reference forward stays available.
+    """
+    if model.runtime.aligned is None:
+        raise ValueError("Qwen4 execution policy must be resolved before packing weights")
+    if model.runtime.aligned and torch.cuda.get_device_capability()[0] == 10:
+        from minisgl.kernel._qwen4_cute.hc_mix import permute_pad_up_weight
+
+        groups = [model.model.hyper_connection_mixer]
+        for layer in model.model.layers.op_list:
+            groups.extend((layer.attn_hyper_connection, layer.mlp_hyper_connection))
+        for gr in groups:
+            gr._sg_up = permute_pad_up_weight(gr.input_mix_weight_up.weight, gr.n)
+    for layer in model.model.layers.op_list:
+        attn = layer.linear_attn or layer.self_attn
+        if model.runtime.aligned and layer.self_attn is not None:
+            rc = attn.config.rotary_config
+            attn._rope_cache = ops.rope_cache(
+                attn.q_norm.weight.device, rc.rotary_dim, rc.base, rc.max_position
+            )
+        projections = (
+            (
+                [attn.in_proj_qkv, attn.in_proj_z, attn.in_proj_b, attn.in_proj_a]
+                if model.runtime.aligned
+                else [attn.in_proj_qkv, attn.in_proj_z, attn.in_proj_a, attn.in_proj_b]
+            )
+            if layer.linear_attn is not None
+            else [attn.q_proj, attn.k_proj, attn.v_proj, attn.indexer.index_qk_proj]
+        )
+        for owner, parts in [
+            (attn, projections),
+            (layer.mlp, [layer.mlp.shared_expert.gate_proj, layer.mlp.shared_expert.up_proj]),
+        ]:
+            owner._widths = [op.weight.shape[0] for op in parts]
+            owner._packed = torch.cat([op.weight for op in parts], dim=0)
+            for op, view in zip(parts, owner._packed.split(owner._widths, 0)):
+                op.weight = view
