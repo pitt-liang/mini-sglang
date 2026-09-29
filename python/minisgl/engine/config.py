@@ -29,6 +29,9 @@ class EngineConfig:
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
+    qwen4_state_cache_mb: int = 1024  # per-rank checkpoint budget, separate from working state
+    qwen4_checkpoint_interval: int = 4096  # sparse retention; prompt replay tails are also saved
+    qwen4_stable_numerics: bool | None = None  # auto: enabled for hybrid prefix reuse
 
     @cached_property
     def hf_config(self):

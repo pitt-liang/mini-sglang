@@ -142,9 +142,10 @@ python -m minisgl --model "meta-llama/Llama-3.1-70B-Instruct" --tp 4 --port 3000
 Once the server is running, you can send requests using standard tools like `curl` or any OpenAI-compatible client.
 
 Qwen3.8-Flash-Next has an experimental native BF16 **text-only** path (GR, GDN,
-QSA, shared/routed MoE and GPU-resident PLE). It supports batched CUDA Graph decode,
-paged sparse prefill and FP32 recurrent state. Prefix reuse, vision, MTP and
-quantization are not supported. Optimized BF16 kernels are not bit-equivalent to
+QSA, shared/routed MoE and PLE). It supports batched CUDA Graph decode,
+paged sparse prefill and FP32 recurrent state. The Qwen4 scheduler maps the default
+`--cache-type radix` to a hybrid prefix cache; `--cache-type naive` disables reuse.
+Vision, MTP and quantization are not supported. Optimized BF16 kernels are not bit-equivalent to
 the reference path; set `MINISGL_QWEN4_REFERENCE=1` and pass
 `--cuda-graph-max-bs 0` to select the eager reference.
 A GB200 numerical-alignment path is enabled by default on SM100/CUDA 13+.
@@ -174,6 +175,82 @@ Transformers `modeling_qwen4_exp.py` to enable their optional reference checks.
 SGLang operator parity tests skip when the reference framework is unavailable;
 it is not required in the production environment.
 
+Qwen4 prefix reuse shares QSA KV/index pages and restores an immutable checkpoint
+of **all** GDN recurrent/conv and PLE conv/token-history states into a private
+request slot. Checkpoints are aligned to `lcm(page_size, 64)`, including a replay
+boundary before the last prompt token. The aligned runtime records FP32 GDN
+state inside a prefill chunk and gathers the matching GDN/PLE convolution windows,
+without splitting that forward. Legacy/reference runtimes stop at the boundary.
+Splitting a radix edge does not invent an intermediate recurrent state; matching
+falls back to the deepest complete checkpoint. Decode state is not published.
+
+`--qwen4-state-cache-mb 1024` caps the per-rank GPU checkpoint pool separately
+from active request state. `--qwen4-checkpoint-interval 4096` controls periodic
+prefill snapshots; the aligned prompt replay tail is also eligible. A KV hit
+beyond the last state checkpoint identifies a shared-prefix junction: replay
+captures its aligned boundary so later branches can resume there. The target
+survives chunked scheduling. Internal tracking currently retains at most one
+boundary per forward, prioritizing that junction, otherwise the deepest eligible
+periodic/prompt boundary. For the
+current BF16 checkpoint, one snapshot costs about 55.23 MiB/rank at TP2 (GDN
+recurrent state stays FP32). Snapshot capacity is reserved before automatic KV
+page sizing. Internal tracking also reserves one scratch state per running-request
+capacity slot, which is included in automatic memory sizing. An exhausted protected
+pool skips new snapshots instead of blocking
+inference. PLE table offload/prefetch settings are independent of prefix caching.
+
+Hybrid reuse enables `--qwen4-stable-numerics` by default: fixed prefill
+projection/reduction geometry and deterministic QSA selection (exact FP32 score,
+lowest index breaks ties, selected indices ordered by position). This avoids
+batch-shape rounding changes and atomic top-k collection order changing outputs
+when a prefix is removed. It is a different numerical policy from the original
+SGLang-style atomic selector, not a claim of bitwise equivalence to SGLang.
+The same flag can be enabled with `--cache-type naive` to isolate cache effects;
+`--no-qwen4-stable-numerics` disables these selections for diagnostics. Ordinary
+decode projection kernels remain unchanged. Non-final prefill chunks also end
+on the 64-token recurrent grid; a batch's leftover budget must not shift later
+requests' GDN chunk boundaries. Explicit total budgets below 64 still make
+progress without this alignment. Kernel geometry alone does not guarantee
+end-to-end invariance for all workloads.
+
+Run the CPU lifecycle tests with
+`.venv/bin/python -m pytest -o addopts='' tests/core/test_hybrid_cache.py`.
+The real-weight regression `tests/models/smoke_qwen4_prefix.py` uses the actual
+overlap scheduler to compare naive and hybrid logits/generation, repeated-prefix
+and three-way branch hits, then measures TTFT without logit capture. Run it with
+TP2 `torchrun`, `--model`, and an `--output` path outside the repository.
+`--prompt-pattern text`, `--max-extend-tokens`, and `--branch-at` exercise textual
+inputs, chunked scheduling, and a previously uncached shared-prefix junction.
+The naive/hybrid comparison uses the same engine and numerical policy.
+The JSON report includes TTFT, mean inter-token latency per request, hit lengths,
+cache lifecycle counters and the runtime configuration. Use `--output-tokens 32`
+or more for decode timing; the default four-token output is an accuracy smoke test.
+`--controlled-topk` selects numerical-test ordering, not stock performance.
+`--trace-components` records suffix activations from the first four layers (or
+the layer IDs selected with `--trace-layers`) to localize numerical differences;
+it is for accuracy diagnosis only. Prefix reuse
+is still experimental: passing cache lifecycle/kernel tests does not establish
+end-to-end logit equivalence or a production speedup. The real-weight regression
+must pass its accuracy gates before treating either as validated.
+
+PLE storage and lookup overlap are independently configurable before startup:
+
+- `MINISGL_QWEN4_PLE_STORAGE=gpu` (default) keeps the BF16 table on the GPU.
+  `=pinned` loads each TP shard directly into pinned CPU memory and uses GPU UVA
+  lookup. It requires a CUDA device with mapped-host-memory/UVA support and enough
+  host RAM: approximately 95.4 GiB total for this checkpoint, or 47.7 GiB per TP2
+  rank. Only the embedding table is offloaded, not projections or request state.
+- `MINISGL_QWEN4_PLE_PREFETCH=1` overlaps local lookup with the preceding decoder
+  layer, for either storage backend. The default `=0` keeps lookup synchronous.
+  TP reduction stays on the model stream; projection, gate and convolution retain
+  their original ordering. Decode graph buffers are retained by batch size.
+
+For host offload with overlap, prefix the command above with
+`MINISGL_QWEN4_PLE_STORAGE=pinned MINISGL_QWEN4_PLE_PREFETCH=1`.
+Host memory bandwidth/topology and stream contention affect performance; offload
+does not guarantee lower latency on every device. No file-backed storage, CPU
+lookup worker, FP8 PLE or cross-DP embedding sharding is implemented.
+
 The implementation keeps model structure and eager/legacy/aligned dispatch in
 `models/qwen4.py`, loading and packing in `models/qwen4_weight.py`, and GPU
 operators in `kernel/qwen4_ops.py` (older numerics use the `legacy_` prefix).
@@ -202,6 +279,9 @@ chunked scheduler prefill, cancellation and slot recycling. It uses controlled
 top-k ordering to isolate regressions, not to certify stock-top-k determinism or
 performance. Use `--compare /path/to/baseline-prefix` to require exact logits
 against captures from a separate run; captures belong outside the repository.
+Run it with all four PLE storage/prefetch combinations against the same baseline.
+The unit suite also checks UVA rows, main-stream reduction, chunk/EOS history,
+padding and repeated graph replay with reordered/recycled slots.
 
 ### 4. Interactive Shell
 

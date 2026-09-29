@@ -34,6 +34,7 @@ class Req:
     uid: int
     sampling_params: SamplingParams
     cache_handle: BaseCacheHandle
+    checkpoint_len: int = 0  # immutable target selected for this prefill forward
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu

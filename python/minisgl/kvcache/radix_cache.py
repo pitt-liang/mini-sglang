@@ -167,12 +167,16 @@ class RadixPrefixCache(BasePrefixCache):
             evicted_indices.append(node.value)
             self.evictable_size -= node.length
             parent = node.parent
+            self._on_evict(node)
             del parent.children[self.key_fn(node._key)]
             # NOTE: root is always protected, so won't be evicted
             if parent.is_leaf() and parent.ref_count == 0:
                 heapq.heappush(leave_nodes, parent)
 
         return torch.cat(evicted_indices)
+
+    def _on_evict(self, node: RadixTreeNode) -> None:
+        """Release optional model state owned by this exact endpoint."""
 
     def reset(self) -> None:
         raise NotImplementedError("RadixManager.reset is not implemented")

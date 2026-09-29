@@ -56,6 +56,38 @@ def independent_hf_reference():
 
 
 class Qwen4OpsTest(unittest.TestCase):
+    def test_numerical_policy_can_be_selected_independently_of_prefix_reuse(self):
+        from minisgl.engine.engine import _adjust_config
+
+        for cache, requested, expected in (
+            ("radix", None, True),
+            ("hybrid", None, True),
+            ("naive", None, False),
+            ("naive", True, True),
+            ("hybrid", False, False),
+        ):
+            with self.subTest(cache=cache, requested=requested):
+                config = SimpleNamespace(
+                    model_config=SimpleNamespace(
+                        is_qwen4=True,
+                        is_moe=True,
+                        qwen4_runtime=Qwen4RuntimeConfig(reference=True, aligned=False),
+                        hybrid={"indexer_compress_ratio": 4},
+                    ),
+                    attention_backend="auto",
+                    moe_backend="fused",
+                    dtype=torch.bfloat16,
+                    cuda_graph_max_bs=0,
+                    cuda_graph_bs=None,
+                    page_size=64,
+                    cache_type=cache,
+                    qwen4_checkpoint_interval=4096,
+                    qwen4_stable_numerics=requested,
+                )
+                with patch("minisgl.engine.engine.logger"):
+                    _adjust_config(config)
+                self.assertEqual(config.qwen4_stable_numerics, expected)
+
     def test_overlap_length_uses_committed_tokens(self):
         from minisgl.core import Req, SamplingParams
         from minisgl.scheduler.scheduler import Scheduler

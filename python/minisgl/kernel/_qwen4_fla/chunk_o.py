@@ -7,7 +7,6 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
-
 from minisgl.kernel._qwen4_fla.index import prepare_chunk_indices
 from minisgl.kernel._qwen4_fla.op import exp, safe_exp
 from minisgl.kernel._qwen4_fla.utils import check_shared_mem, is_nvidia_hopper
@@ -137,7 +136,10 @@ def chunk_fwd_o(
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
+    # A cache-hit suffix must use the same reduction tile as the corresponding
+    # tail of a long prefill. Shrinking BT changes MMA rounding even when the
+    # restored FP32 state and all suffix inputs are bit-identical.
+    BT = chunk_size
     chunk_indices = (
         prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     )

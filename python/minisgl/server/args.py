@@ -216,6 +216,25 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         choices=["auto"] + SUPPORTED_MOE_BACKENDS.supported_names(),
         help="The MoE backend to use.",
     )
+    parser.add_argument(
+        "--qwen4-stable-numerics",
+        action=argparse.BooleanOptionalAction,
+        default=ServerArgs.qwen4_stable_numerics,
+        help="Use shape-stable Qwen4 prefill kernels and deterministic QSA selection (default: enabled with hybrid prefix caching).",
+    )
+
+    parser.add_argument(
+        "--qwen4-state-cache-mb",
+        type=int,
+        default=ServerArgs.qwen4_state_cache_mb,
+        help="Per-rank Qwen4 prefix state cache budget in MiB.",
+    )
+    parser.add_argument(
+        "--qwen4-checkpoint-interval",
+        type=int,
+        default=ServerArgs.qwen4_checkpoint_interval,
+        help="Qwen4 sparse checkpoint interval in tokens.",
+    )
 
     parser.add_argument(
         "--shell-mode",

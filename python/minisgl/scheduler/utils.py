@@ -17,6 +17,7 @@ class PendingReq:
     input_ids: torch.Tensor
     sampling_params: SamplingParams
     chunked_req: ChunkedReq | None = None
+    branch_checkpoint_len: int = 0
 
     @property
     def input_len(self) -> int:

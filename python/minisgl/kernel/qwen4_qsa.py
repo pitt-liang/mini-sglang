@@ -552,13 +552,18 @@ def _merge(P, L, O, GH: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr, S: tl.
     tl.store(O + ((row * HKV + group) * GH + h) * D + d, out)
 
 
-def sparse_gqa(q, k, v, indices, table, slots, decode=False, sglang_prefill_rows=None):
+def sparse_gqa(
+    q, k, v, indices, table, slots, decode=False, sglang_prefill_rows=None, stable_prefill=False
+):
     rows, hq, d = q.shape
     hkv = k.shape[-2]
     bn, warps, stages = 32, 4, 3
     if sglang_prefill_rows is not None:
         stages = 2
-        if sglang_prefill_rows <= 32:
+        if stable_prefill:
+            # Keep the long-prefill softmax/reduction geometry after a cache hit.
+            bn, warps = 16, 1
+        elif sglang_prefill_rows <= 32:
             bn, warps = 32, 8
         elif sglang_prefill_rows <= 64:
             bn, warps = 64, 8

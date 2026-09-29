@@ -17,6 +17,8 @@ class Qwen4Metadata(BaseAttnMetadata):
     lengths: torch.Tensor | None = None
     valid: torch.Tensor | None = None
     cu_seqlens: torch.Tensor | None = None
+    track_offsets: tuple[int, ...] = ()
+    track_chunk_idx: torch.Tensor | None = None
 
     def get_last_indices(self, bs):
         return self.last_indices[:bs]
@@ -39,6 +41,22 @@ class Qwen4ReferenceBackend(BaseAttnBackend):
             tuple(spans),
             torch.tensor([span[-1] - 1 for span in spans], device=get_global_ctx().kv_cache.device),
         )
+        pool = get_global_ctx().kv_cache
+        if getattr(pool, "internal_checkpoints", False) and batch.is_prefill:
+            offsets = tuple(
+                req.checkpoint_len - req.cached_len if req.checkpoint_len else 0
+                for req in batch.reqs
+            )
+            if any(offsets):
+                batch.attn_metadata.track_offsets = offsets
+                batch.attn_metadata.track_chunk_idx = torch.tensor(
+                    [
+                        offset // 64 if 0 < offset < req.extend_len else -1
+                        for req, offset in zip(batch.reqs, offsets)
+                    ],
+                    dtype=torch.int32,
+                    device=pool.device,
+                )
 
     def forward(self, q, k, v, layer_id, batch):
         raise RuntimeError("Qwen4 requires indexer keys as well as core Q/K/V")
@@ -218,7 +236,11 @@ class Qwen4Backend(Qwen4ReferenceBackend):
                     iq, pool.index_keys[li], table, m.slots, m.lengths, m.valid, ratio, budget
                 )
                 nb = m.lengths // ratio
-                chosen = aligned.index_topk(scores, torch.where(m.valid, nb, 0))
+                chosen = aligned.index_topk(
+                    scores,
+                    torch.where(m.valid, nb, 0),
+                    stable=getattr(pool, "stable_numerics", False),
+                )
                 indices = self.expand(chosen, nb, m.lengths, m.valid, ratio)
                 return self.aligned_decode(q, kc, vc, indices, table, m.slots)
             if table.shape[1] // ratio <= 2048 and not self.runtime.aligned:
@@ -307,7 +329,11 @@ class Qwen4Backend(Qwen4ReferenceBackend):
                     scores = scores.masked_fill(blocks[None, :] >= counts[:, None], -float("inf"))
                     if self.runtime.aligned:
                         scores = scores / (iq.shape[-1] ** 0.5)
-                        chosen = aligned.index_topk(scores.contiguous(), counts)
+                        chosen = aligned.index_topk(
+                            scores.contiguous(),
+                            counts,
+                            stable=getattr(pool, "stable_numerics", False),
+                        )
                     else:
                         chosen = scores.topk(min(budget // ratio, nb), dim=-1).indices
                         chosen = torch.where(
@@ -327,6 +353,7 @@ class Qwen4Backend(Qwen4ReferenceBackend):
                     table,
                     slots,
                     sglang_prefill_rows=q.shape[0] if self.runtime.aligned else None,
+                    stable_prefill=getattr(pool, "stable_numerics", False),
                 )
         return out
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import replace
 from datetime import timedelta
@@ -87,6 +88,22 @@ class Engine:
             dtype=self.dtype,
             max_running_req=config.max_running_req,
         )
+        if config.model_config.is_qwen4:
+            self.kv_cache.stable_numerics = config.qwen4_stable_numerics
+        if getattr(config, "cache_type", None) == "hybrid":
+            from minisgl.kvcache.qwen4_pool import Qwen4StatePool
+
+            self.kv_cache.prefix_states = Qwen4StatePool(self.kv_cache, self.state_cache_slots)
+            runtime = config.model_config.qwen4_runtime
+            self.kv_cache.internal_checkpoints = runtime.aligned and runtime.enabled()
+            if self.kv_cache.internal_checkpoints:
+                self.kv_cache.track_states = Qwen4StatePool(self.kv_cache, config.max_running_req)
+            self.kv_cache.checkpoint_alignment = math.lcm(config.page_size, 64)
+            self.kv_cache.checkpoint_interval = config.qwen4_checkpoint_interval
+            logger.info_rank0(
+                f"Qwen4 prefix cache: {self.state_cache_slots} checkpoints, "
+                f"{mem_GB(self.kv_cache.prefix_states.nbytes)} per rank"
+            )
 
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
@@ -196,6 +213,23 @@ class Engine:
             state_bytes = recurrent_bytes(
                 config.model_config, config.max_running_req + 1, config.tp_info.size, self.dtype
             )
+            if getattr(config, "cache_type", None) == "hybrid":
+                # recurrent_bytes includes the tiny QSA pending ring; excluding
+                # it yields the exact immutable snapshot size.
+                per_state = recurrent_bytes(config.model_config, 1, config.tp_info.size, self.dtype)
+                per_state -= (
+                    config.model_config.num_kv_layers
+                    * (c["indexer_compress_ratio"] - 1)
+                    * c["indexer_head_dim"]
+                    * self.dtype.itemsize
+                )
+                self.state_cache_slots = config.qwen4_state_cache_mb * 1024**2 // per_state
+                if self.state_cache_slots < 1:
+                    raise ValueError("Qwen4 state cache budget must fit at least one checkpoint")
+                state_bytes += self.state_cache_slots * per_state
+                runtime = config.model_config.qwen4_runtime
+                if runtime.aligned and runtime.enabled():
+                    state_bytes += config.max_running_req * per_state
         num_pages = config.num_page_override
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
@@ -285,11 +319,25 @@ def _adjust_config(config: EngineConfig):
         if config.page_size == 1:
             override("page_size", config.model_config.hybrid["indexer_compress_ratio"])
         if hasattr(config, "cache_type"):
-            override("cache_type", "naive")
+            if config.cache_type == "radix":
+                override("cache_type", "hybrid")
+            alignment = math.lcm(config.page_size, 64)
+            if (
+                config.qwen4_checkpoint_interval < alignment
+                or config.qwen4_checkpoint_interval % alignment
+            ):
+                raise ValueError(
+                    "Qwen4 checkpoint interval must be a multiple of lcm(page_size, 64)"
+                )
+        if config.qwen4_stable_numerics is None:
+            override("qwen4_stable_numerics", getattr(config, "cache_type", None) == "hybrid")
         logger.warning_rank0(
-            "Qwen4 experimental BF16 text path: naive cache, no vision/MTP/quantization; "
+            "Qwen4 experimental BF16 text path: no vision/MTP/quantization; "
             "MINISGL_QWEN4_REFERENCE=1 selects the eager reference implementation"
         )
+
+    elif getattr(config, "cache_type", None) == "hybrid":
+        raise ValueError("Hybrid prefix caching currently requires Qwen4")
 
     if config.attention_backend == "auto":
         backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")

@@ -35,6 +35,7 @@ class PrefillAdder:
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
+    chunk_alignment: int = 1
 
     def _try_allocate_one(self, req: PendingReq) -> Tuple[BaseCacheHandle, int] | None:
         if self.table_manager.available_size == 0:
@@ -54,11 +55,16 @@ class PrefillAdder:
             return self.cache_manager.unlock(handle)
 
         table_idx = self.table_manager.allocate()
+        if self.cache_manager.hybrid:
+            # Keep the original divergence target across chunked forwards,
+            # even if an earlier checkpoint replaces the request's handle.
+            req.branch_checkpoint_len = handle.raw_hit_len
         if cached_len > 0:  # NOTE: set the cached part
             device_ids = self.table_manager.token_pool[table_idx][:cached_len]
             page_entry = self.table_manager.page_table[table_idx][:cached_len]
             device_ids.copy_(req.input_ids[:cached_len].pin_memory(), non_blocking=True)
             page_entry.copy_(handle.get_matched_indices())
+            self.cache_manager.restore_state(handle, table_idx)
 
         return handle, table_idx
 
@@ -71,6 +77,19 @@ class PrefillAdder:
     ) -> Req:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
+        if chunk_size < remain_len:
+            # Keep recurrent chunk boundaries independent of how earlier
+            # requests consumed this batch's token budget.
+            chunk_size = (
+                cached_len + chunk_size
+            ) // self.chunk_alignment * self.chunk_alignment - cached_len
+        end, checkpoint_len = self.cache_manager.plan_checkpoint(
+            cached_len,
+            cached_len + chunk_size,
+            pending_req.input_len,
+            pending_req.branch_checkpoint_len,
+        )
+        chunk_size = end - cached_len
         is_chunked = chunk_size < remain_len
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
@@ -87,10 +106,11 @@ class PrefillAdder:
             uid=pending_req.uid,
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
+            checkpoint_len=checkpoint_len,
         )
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
-        if self.token_budget <= 0:
+        if self.token_budget < self.chunk_alignment:
             return None
 
         if chunked_req := pending_req.chunked_req:
@@ -119,6 +139,7 @@ class PrefillManager:
     table_manager: TableManager
     decode_manager: DecodeManager
     pending_list: List[PendingReq] = field(default_factory=list)
+    chunk_alignment: int = 1
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params))
@@ -133,6 +154,9 @@ class PrefillManager:
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
+            # Explicit tiny budgets must still make progress; alignment is a
+            # numerical policy, not a minimum supported scheduler budget.
+            chunk_alignment=self.chunk_alignment if prefill_budget >= self.chunk_alignment else 1,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []

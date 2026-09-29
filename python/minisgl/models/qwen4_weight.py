@@ -54,8 +54,15 @@ def load_qwen4_weights(model, model_path, device):
     for number, (name, owner, attr, meta) in enumerate(_parameters(model)):
         key = "model.language_model." + name[len("model.") :] if name.startswith("model.") else name
         dtype = torch.float32 if attr in ("A_log", "dt_bias") else meta.dtype
-        dst = torch.empty(meta.shape, dtype=dtype, device=device)
-        if ".ple_embedding.ngram_embedding.weight" in name:
+        is_ple_table = ".ple_embedding.ngram_embedding.weight" in name
+        if is_ple_table and model.runtime.ple_storage == "pinned":
+            ops.validate_ple_host_device(device)
+            # Load TP-owned checkpoint rows directly into host storage, never
+            # allocate/stage the complete table on the GPU first.
+            dst = torch.empty(meta.shape, dtype=dtype, device="cpu", pin_memory=True)
+        else:
+            dst = torch.empty(meta.shape, dtype=dtype, device=device)
+        if is_ple_table:
             prefix = key[: -len("weight")]
             shard_keys = sorted(
                 (k for k in index if k.startswith(prefix + "shard_")),

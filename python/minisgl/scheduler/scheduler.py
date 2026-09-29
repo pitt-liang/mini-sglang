@@ -61,7 +61,10 @@ class Scheduler(SchedulerIOMixin):
         )
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
-            self.cache_manager, self.table_manager, self.decode_manager
+            self.cache_manager,
+            self.table_manager,
+            self.decode_manager,
+            chunk_alignment=64 if getattr(self.engine.kv_cache, "stable_numerics", False) else 1,
         )
 
         # some alias for easy access
@@ -83,6 +86,8 @@ class Scheduler(SchedulerIOMixin):
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
+        if self.cache_manager.hybrid:
+            logger.info_rank0(f"Qwen4 prefix cache: {self.cache_manager.prefix_cache.stats}")
 
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
         """
@@ -205,6 +210,10 @@ class Scheduler(SchedulerIOMixin):
             raise NotImplementedError
 
     def _free_req_resources(self, req: Req) -> None:
+        if self.cache_manager.hybrid:
+            # Request/page slots may be reused immediately by the CPU scheduler,
+            # but metadata writes must wait for their last in-flight reader.
+            self.stream.wait_stream(self.engine.stream)
         self.table_manager.free(req.table_idx)
         self.cache_manager.cache_req(req, finished=True)
 
@@ -235,6 +244,14 @@ class Scheduler(SchedulerIOMixin):
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
         forward_output = self.engine.forward_batch(batch, sample_args)
+        published = False
+        if batch.is_prefill and self.cache_manager.hybrid:
+            for row, req in enumerate(batch.reqs):
+                published |= self.cache_manager.publish_checkpoint(req, row)
+        if published:
+            # Publishing may rebind duplicate page-table entries on the engine
+            # stream. Future metadata gathers must see the canonical mapping.
+            self.stream.wait_stream(self.engine.stream)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output

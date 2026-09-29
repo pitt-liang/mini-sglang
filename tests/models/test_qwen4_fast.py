@@ -17,6 +17,233 @@ class FastTests(unittest.TestCase):
     def tensor(self, *shape):
         return torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
 
+    def test_ple_lookup_host_and_device_shards(self):
+        """UVA and device lookup must preserve all 160 values, including TP masks."""
+        from minisgl.models.qwen4 import NGramTable
+
+        weight = self.tensor(31, 160)
+        ids = torch.tensor([0, 16, 17, 18, 47, 48, 100], device="cuda")
+        expected = torch.zeros((ids.numel(), 160), device="cuda", dtype=weight.dtype)
+        expected[2:5] = weight[torch.tensor([0, 1, 30], device="cuda")]
+        for storage in ("gpu", "pinned"):
+            table = object.__new__(NGramTable)
+            table.vocab_range = (17, 31)
+            table.tp_size = 1
+            table.weight = weight if storage == "gpu" else weight.cpu().pin_memory()
+            table.initialize_runtime(torch.device("cuda"))
+            actual = table.lookup_local(ids)
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            out = torch.empty_like(expected)
+            self.assertIs(table.lookup_local(ids, out), out)
+            torch.testing.assert_close(out, expected, atol=0, rtol=0)
+            self.assertEqual(table.lookup_local(ids[:0]).shape, (0, 160))
+            with self.assertRaises(ValueError):
+                table.lookup_local(ids, out[:, :80].contiguous())
+
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                table.lookup_local(ids, out)
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    table.lookup_local(ids, out)
+                torch.cuda.current_stream().wait_stream(stream)
+            ids[2] = 47
+            graph.replay()
+            torch.testing.assert_close(out[2], weight[30], atol=0, rtol=0)
+            ids[2] = 17
+
+    def test_ple_prefetch_preserves_history_and_graph_replay(self):
+        """All storage/scheduling modes preserve chunk, EOS, padding and slot state."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from minisgl.models.qwen4 import PLE
+        from minisgl.models.qwen4_weight import _parameters
+        from sympy import nextprime
+
+        def run(storage, prefetch, captured):
+            torch.manual_seed(73)
+            cfg = SimpleNamespace(
+                qwen4_runtime=Qwen4RuntimeConfig(
+                    aligned=True, ple_storage=storage, ple_prefetch=prefetch
+                ),
+                hidden_size=512,
+                rms_norm_eps=1e-6,
+                hybrid={
+                    "ple_layer_ids": [2],
+                    "hc_count": 4,
+                    "ple_embed_dim": 640,
+                    "ple_conv_kernel_size": 4,
+                    "heads_per_ngram": 2,
+                    "ngram_size": 3,
+                    "ngram_vocab_size_base": 97,
+                    "make_ngram_vocab_size_divisible_by": 1,
+                    "eos_token_id": 2,
+                },
+            )
+            with patch(
+                "minisgl.layers.embedding.get_tp_info", return_value=SimpleNamespace(rank=0, size=1)
+            ):
+                ple = PLE(cfg, 1)
+            for _, owner, attr, weight in _parameters(ple):
+                if weight.is_floating_point():
+                    setattr(owner, attr, self.tensor(*weight.shape) * 0.03)
+            pe = ple.ple_embedding
+            sizes, prime = [], 96
+            for _ in range(4):
+                prime = int(nextprime(prime))
+                sizes.append(prime)
+            pe.layer_multipliers = torch.tensor([31, 139, 241], device="cuda")
+            pe.ngram_heads_vocab_sizes = torch.tensor(sizes, device="cuda")
+            pe.ngram_heads_offsets = torch.tensor(
+                [0, *torch.tensor(sizes).cumsum(0).tolist()[:-1]], device="cuda"
+            )
+            table = pe.ngram_embedding
+            if storage == "pinned":
+                table.weight = table.weight.cpu().pin_memory()
+            ple.initialize_runtime(torch.device("cuda"))
+
+            def reduce_on_main(x):
+                if ple._prefetch_stream is not None:
+                    self.assertNotEqual(torch.cuda.current_stream(), ple._prefetch_stream)
+                return x
+
+            table.tp_size = 2
+            table._comm = SimpleNamespace(all_reduce=reduce_on_main)
+            history = torch.full((3, 2), 2, device="cuda", dtype=torch.int64)
+            conv = torch.zeros((3, 2048, 9), device="cuda", dtype=torch.bfloat16)
+            ctx = SimpleNamespace(
+                kv_cache=SimpleNamespace(ple_history={1: history}, ple_conv={1: conv})
+            )
+            result = []
+
+            def forward(x):
+                ple.start_prefetch()
+                out = ple.forward(x)
+                self.assertIsNone(ple._prefetch_state)
+                return out
+
+            with patch("minisgl.models.qwen4.get_global_ctx", return_value=ctx):
+                for chunk in range(2):
+                    ctx.batch = SimpleNamespace(
+                        is_prefill=True,
+                        input_ids=torch.tensor(
+                            [4, 5, 2, 7, 8, 9, 2], device="cuda", dtype=torch.int32
+                        ),
+                        attn_metadata=SimpleNamespace(
+                            spans=[(0, chunk * 4, 4, 0, 4), (1, chunk * 3, 3, 4, 7)],
+                            track_offsets=(),
+                        ),
+                    )
+                    result.extend(
+                        [forward(self.tensor(7, 2048)).clone(), history.clone(), conv.clone()]
+                    )
+                ctx.batch = SimpleNamespace(
+                    is_prefill=False,
+                    input_ids=torch.tensor([7, 2, 0, 0], device="cuda", dtype=torch.int32),
+                    attn_metadata=SimpleNamespace(
+                        slots=torch.tensor([1, 0, 2, 2], device="cuda", dtype=torch.int32),
+                        valid=torch.tensor([True, True, False, False], device="cuda"),
+                    ),
+                )
+                x = self.tensor(4, 2048)
+                if captured:
+                    saved_history, saved_conv = history.clone(), conv.clone()
+                    forward(x)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        output = forward(x)
+                    history.copy_(saved_history)
+                    conv.copy_(saved_conv)
+                for step in range(8):
+                    ctx.batch.input_ids[:2].copy_(
+                        torch.tensor([step + 3, 2 if step == 3 else step + 7], device="cuda")
+                    )
+                    ctx.batch.attn_metadata.slots[:2].copy_(
+                        torch.tensor([step % 2, 1 - step % 2], device="cuda")
+                    )
+                    if step == 4:  # cancellation followed by slot reuse
+                        history[0].fill_(2)
+                        conv[0].zero_()
+                    if captured:
+                        graph.replay()
+                    else:
+                        output = forward(x)
+                    result.extend([output.clone(), history.clone(), conv.clone()])
+                torch.testing.assert_close(
+                    history[2], torch.full_like(history[2], 2), atol=0, rtol=0
+                )
+                torch.testing.assert_close(conv[2], torch.zeros_like(conv[2]), atol=0, rtol=0)
+            torch.cuda.synchronize()
+            return result
+
+        expected = run("gpu", False, False)
+        for storage in ("gpu", "pinned"):
+            for prefetch in (False, True):
+                for captured in (False, True):
+                    with self.subTest(storage=storage, prefetch=prefetch, graph=captured):
+                        actual = run(storage, prefetch, captured)
+                        for a, b in zip(actual, expected):
+                            torch.testing.assert_close(a, b, atol=0, rtol=0)
+
+    def test_ple_loader_streams_only_owned_rows_to_pinned_memory(self):
+        import json
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from minisgl.distributed import DistributedInfo
+        from minisgl.models.qwen4_weight import load_qwen4_weights
+        from safetensors.torch import save_file
+
+        weight = torch.arange(7 * 160, dtype=torch.float32).reshape(7, 160).bfloat16()
+        prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding."
+        shards = {prefix + "shard_0.weight": weight[:3], prefix + "shard_1.weight": weight[3:]}
+        table = SimpleNamespace(
+            weight=torch.empty((4, 160), device="meta", dtype=torch.bfloat16),
+            vocab_range=(3, 4),
+            num_embeddings=7,
+        )
+        model = SimpleNamespace(
+            runtime=Qwen4RuntimeConfig(ple_storage="pinned"),
+            config=SimpleNamespace(
+                hybrid={
+                    "linear_num_key_heads": 1,
+                    "linear_key_head_dim": 1,
+                    "linear_num_value_heads": 1,
+                    "linear_value_head_dim": 1,
+                    "split_ngram_parts": 2,
+                }
+            ),
+        )
+        parameter = (
+            "model.layers.1.ple.ple_embedding.ngram_embedding.weight",
+            table,
+            "weight",
+            table.weight,
+        )
+        with TemporaryDirectory() as directory:
+            save_file(shards, str(Path(directory) / "weights.safetensors"))
+            (Path(directory) / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": dict.fromkeys(shards, "weights.safetensors")})
+            )
+            before = torch.cuda.memory_allocated()
+            with (
+                patch("minisgl.models.qwen4_weight._parameters", return_value=[parameter]),
+                patch("minisgl.models.qwen4_weight.download_hf_weight", return_value=directory),
+                patch("minisgl.distributed.info._TP_INFO", DistributedInfo(1, 2)),
+            ):
+                load_qwen4_weights(model, directory, torch.device("cuda"))
+            self.assertEqual(torch.cuda.memory_allocated(), before)
+        self.assertEqual(table.weight.device.type, "cpu")
+        self.assertTrue(table.weight.is_pinned())
+        torch.testing.assert_close(table.weight, weight[3:], atol=0, rtol=0)
+
     def test_norm_rope(self):
         for h, d, rd in [(12, 256, 64), (4, 128, 64)]:
             x = self.tensor(5, h, d * 2)[..., :d]

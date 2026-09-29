@@ -23,6 +23,71 @@ class CacheManager:
         self.num_pages = num_pages
         self.page_table = page_table
         self.page_size = page_size
+        self.hybrid = type == "hybrid"
+
+    def restore_state(self, handle, table_idx):
+        if self.hybrid:
+            self.prefix_cache.restore(handle, table_idx)
+
+    def plan_checkpoint(self, start, end, prompt_len, branch_len=0):
+        """Stop at an actual state boundary, never relabel a later state.
+
+        Short token budgets can make progress without publishing a checkpoint.
+        Always preserve a replay tail before the last prompt token, including
+        when the full prompt itself is aligned.
+        """
+        if not self.hybrid:
+            return end, 0
+        cache = self.prefix_cache
+        tail = (prompt_len - 1) // cache.alignment * cache.alignment
+        branch = min(branch_len, prompt_len - 1) // cache.alignment * cache.alignment
+        periodic = (start // cache.interval + 1) * cache.interval
+        targets = [p for p in (tail, periodic, branch) if start < p <= end]
+        if not targets:
+            return end, 0
+        if cache.internal:
+            # The kernel can record one internal boundary without splitting the
+            # forward. Prefer the deepest useful boundary in this chunk.
+            periodic = end // cache.interval * cache.interval
+            # A real divergence is more useful than a later one-off prompt
+            # tail when the one-checkpoint-per-forward budget is exhausted.
+            target = (
+                branch
+                if start < branch <= end
+                else max(p for p in (tail, periodic) if start < p <= end)
+            )
+            if (target - start) % 64 == 0:
+                return end, target
+        target = min(targets)
+        return target, target
+
+    def publish_checkpoint(self, req, batch_row=0):
+        """Called on the engine stream immediately after this prefill forward."""
+        length = req.checkpoint_len
+        if not self.hybrid or not length:
+            return False
+        assert length <= req.cached_len
+        old = req.cache_handle
+        indices = self.page_table[req.table_idx, :length]
+        source, tensors = req.table_idx, None
+        if self.prefix_cache.internal:
+            source = batch_row
+            tensors = self.prefix_cache.states.working.track_states.tensors
+        result = self.prefix_cache.insert_checkpoint(
+            req.input_ids[:length], indices, source, tensors
+        )
+        if result is None:
+            return False
+        matched, handle = result
+        self.lock(handle)
+        # A concurrent request may already own canonical KV for these tokens.
+        # Rebind before freeing our duplicates; indexer pages follow the KV IDs.
+        duplicates = indices[old.cached_len : matched].clone()
+        indices.copy_(handle.get_matched_indices())
+        self.unlock(old)
+        req.cache_handle = handle
+        self._free(duplicates)
+        return True
 
     def match_req(self, req: PendingReq) -> MatchResult:
         input_len = req.input_len
@@ -53,6 +118,15 @@ class CacheManager:
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
+        if self.hybrid:
+            # Checkpoints were already captured at their GPU forward boundary.
+            # The current working state may be ahead of committed host tokens.
+            if finished:
+                handle = req.cache_handle
+                indices = self.page_table[req.table_idx, handle.cached_len : req.cached_len]
+                self._free(indices)
+                self.unlock(handle)
+            return
         # ==================================== valid cache region ====================================
         # [0, req.cached_len)                       This part is valid for attention kernel read/write.
         # [0, old_handle.cached_len)                This part is in the prefix cache before prefill.

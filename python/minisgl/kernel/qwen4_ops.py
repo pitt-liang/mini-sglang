@@ -18,6 +18,77 @@ from .utils import load_jit
 
 
 # Shared helpers and legacy BF16 primitives.
+def validate_ple_host_device(device):
+    """Fail before allocating a large pinned table on an unsupported device."""
+    from cuda.bindings import runtime
+
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    for attr in ("cudaDevAttrCanMapHostMemory", "cudaDevAttrUnifiedAddressing"):
+        error, supported = runtime.cudaDeviceGetAttribute(
+            getattr(runtime.cudaDeviceAttr, attr), index
+        )
+        if error != runtime.cudaError_t.cudaSuccess or not supported:
+            raise RuntimeError(f"Pinned PLE requires CUDA {attr} on {device}: {error}")
+
+
+def ple_host_pointer(weight, device):
+    from cuda.bindings import runtime
+
+    if weight.device.type != "cpu" or not weight.is_pinned():
+        raise ValueError("PLE host table must be allocated in pinned CPU memory")
+    validate_ple_host_device(device)
+    error, pointer = runtime.cudaHostGetDevicePointer(weight.data_ptr(), 0)
+    if error != runtime.cudaError_t.cudaSuccess:
+        raise RuntimeError(f"Cannot map pinned PLE table into CUDA: {error}")
+    return pointer
+
+
+@tr.jit
+def _ple_lookup(
+    WEIGHT,
+    IDS,
+    OUT,
+    START: tl.constexpr,
+    ROWS: tl.constexpr,
+    DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    local = tl.load(IDS + row).to(tl.int64) - START
+    col = tl.arange(0, BLOCK)
+    weight = WEIGHT.to(tl.uint64).to(tl.pointer_type(tl.bfloat16))
+    value = tl.load(
+        weight + local * DIM + col, (local >= 0) & (local < ROWS) & (col < DIM), other=0
+    )
+    tl.store(OUT + row * DIM + col, value, col < DIM)
+
+
+def ple_lookup(pointer, ids, out, start, rows):
+    """Local BF16 rows only; the caller owns both the mapped table and output."""
+    if ids.dtype != torch.int64 or not ids.is_cuda or not ids.is_contiguous():
+        raise ValueError("PLE lookup IDs must be contiguous CUDA int64")
+    if (
+        out.dtype != torch.bfloat16
+        or out.device != ids.device
+        or not out.is_contiguous()
+        or out.ndim != 2
+        or out.shape[0] != ids.numel()
+    ):
+        raise ValueError("PLE lookup output must be contiguous CUDA BF16 [ids, width]")
+    if ids.numel():
+        _ple_lookup[(ids.numel(),)](
+            pointer,
+            ids,
+            out,
+            start,
+            rows,
+            out.shape[1],
+            tr.next_power_of_2(out.shape[1]),
+            num_warps=4,
+        )
+    return out
+
+
 @tr.jit
 def _legacy_gdn_gates(
     A, B, LOG, DT, G, BETA, H: tl.constexpr, STRIDE: tl.constexpr, N: tl.constexpr
@@ -555,16 +626,19 @@ def _index_module(dim):
 @lru_cache(None)
 def _topk_module():
     return load_jit(
-        "qwen4_topk", cuda_files=["qwen4_topk.cu"], cuda_wrappers=[("run", "Qwen4FastTopK::run")]
+        "qwen4_topk",
+        cuda_files=["qwen4_topk.cu"],
+        cuda_wrappers=[("run", "Qwen4FastTopK::run"), ("stable", "Qwen4FastTopK::stable")],
     )
 
 
-def index_topk(scores, lengths):
+def index_topk(scores, lengths, *, stable=False):
     if scores.dtype != torch.float32 or scores.stride(-1) != 1:
         raise ValueError("QSA top-k requires contiguous FP32 score rows")
     starts = torch.zeros(scores.shape[0], device=scores.device, dtype=torch.int32)
     out = torch.empty((scores.shape[0], 512), device=scores.device, dtype=torch.int32)
-    _topk_module().run(scores, starts, out, lengths.to(torch.int32).contiguous())
+    select = _topk_module().stable if stable else _topk_module().run
+    select(scores, starts, out, lengths.to(torch.int32).contiguous())
     return out
 
 
@@ -604,11 +678,11 @@ def _moe_combine(X, W, SHARED, ROUTED, OUT, H: tl.constexpr, N: tl.constexpr):
     tl.store(OUT + row * H + col, gate * shared + routed, col < H)
 
 
-def moe_combine(x, gate_weight, shared, routed):
+def moe_combine(x, gate_weight, shared, routed, *, stable=False):
     """FP32 gate/merge before the single TP reduction, as in SGLang."""
     rows, h = x.shape
     warps = max(min(tr.next_power_of_2(tr.cdiv(h, 256)), 32), 4)
-    if rows >= 1024:
+    if stable or rows >= 1024:
         warps = min(warps, 8)
     out = torch.empty_like(routed)
     _moe_combine[(rows,)](
@@ -712,13 +786,15 @@ def _gdn_output(X, Z, W, O, M, D: tl.constexpr, R: tl.constexpr):
     tl.store(O + offsets, y, rows[:, None] < M)
 
 
-def gdn_output(x, z, weight, eps=1e-6):
+def gdn_output(x, z, weight, eps=1e-6, *, stable=False):
     if eps != 1e-6:
         raise ValueError("Qwen4 checkpoint expects rms_norm_eps=1e-6")
     x, z = x.contiguous(), z.contiguous()
     rows, d = x.numel() // x.shape[-1], x.shape[-1]
     sm = torch.cuda.get_device_properties(x.device).multi_processor_count
-    block_rows = min(tr.next_power_of_2(tr.cdiv(rows, 2 * sm)), 4)
+    # Different row layouts can change compiler contraction/rounding even
+    # without changing the mathematical per-head reduction.
+    block_rows = 4 if stable else min(tr.next_power_of_2(tr.cdiv(rows, 2 * sm)), 4)
     out = torch.empty_like(x)
     _gdn_output[(tr.cdiv(rows, block_rows),)](x, z, weight, out, rows, d, block_rows, num_warps=1)
     return out
@@ -850,3 +926,71 @@ def gr_project_mix_large(x, down, up, hc, hidden):
     gate = F.silu(F.linear(x, down) / hc)
     gate = torch.sigmoid(F.linear(gate, up)).unflatten(-1, (hc, hidden))
     return (gate * x.unflatten(-1, (hc, hidden))).mean(-2)
+
+
+@tr.jit
+def _linear_stable(
+    X, W, Y, M, N: tl.constexpr, K: tl.constexpr, SX: tl.constexpr, BM: tl.constexpr
+):
+    # Fixed MMA/reduction geometry: a suffix must not select a different
+    # reduction algorithm merely because its prefill has fewer token rows.
+    m = tl.program_id(0) * BM + tl.arange(0, BM)
+    n = tl.program_id(1) * 64 + tl.arange(0, 64)
+    k = tl.arange(0, 64)
+    acc = tl.zeros((BM, 64), tl.float32)
+    for start in range(tl.cdiv(K, 64)):
+        kk = start * 64 + k
+        a = tl.load(X + m[:, None] * SX + kk[None, :], (m[:, None] < M) & (kk[None, :] < K), 0)
+        b = tl.load(W + n[None, :] * K + kk[:, None], (n[None, :] < N) & (kk[:, None] < K), 0)
+        acc = tl.dot(a, b, acc)
+    tl.store(Y + m[:, None] * N + n[None, :], acc, (m[:, None] < M) & (n[None, :] < N))
+
+
+def linear_stable(x, weight):
+    if x.dtype != torch.bfloat16 or weight.dtype != x.dtype:
+        raise ValueError("Stable Qwen4 projection requires BF16")
+    if x.ndim != 2 or weight.ndim != 2 or x.shape[1] != weight.shape[1]:
+        raise ValueError("Invalid Qwen4 projection shape")
+    x, weight = x.contiguous(), weight.contiguous()
+    m, k = x.shape
+    n = weight.shape[0]
+    out = torch.empty((m, n), device=x.device, dtype=x.dtype)
+    bm = 64 if n >= 512 else 16
+    _linear_stable[(tr.cdiv(m, bm), tr.cdiv(n, 64))](
+        x, weight, out, m, n, k, x.stride(0), bm, num_warps=4, num_stages=3
+    )
+    return out
+
+
+@tr.jit
+def _gr_stable_activation(X, Y, SIZE, HC: tl.constexpr):
+    i = tl.program_id(0) * 256 + tl.arange(0, 256)
+    x = tl.load(X + i, i < SIZE, 0).to(tl.float32) / HC
+    tl.store(Y + i, x * tl.sigmoid(x), i < SIZE)
+
+
+@tr.jit
+def _gr_stable_finish(X, G, Y, SIZE, H: tl.constexpr, HC: tl.constexpr):
+    i = tl.program_id(0) * 256 + tl.arange(0, 256)
+    row, col = i // H, i % H
+    result = tl.full((256,), 0, tl.float32)
+    for branch in tl.static_range(HC):
+        offset = row * HC * H + branch * H + col
+        gate = tl.load(G + offset, i < SIZE, 0).to(tl.float32)
+        x = tl.load(X + offset, i < SIZE, 0).to(tl.float32)
+        result += tl.sigmoid(gate) * x
+    tl.store(Y + i, result / HC, i < SIZE)
+
+
+def gr_project_mix_stable(x, down, up, hc, hidden):
+    projected = linear_stable(x, down)
+    gate = torch.empty_like(projected)
+    _gr_stable_activation[(tr.cdiv(gate.numel(), 256),)](
+        projected, gate, gate.numel(), hc, enable_fp_fusion=False
+    )
+    gate = linear_stable(gate, up)
+    out = torch.empty((x.shape[0], hidden), dtype=x.dtype, device=x.device)
+    _gr_stable_finish[(tr.cdiv(out.numel(), 256),)](
+        x, gate, out, out.numel(), hidden, hc, enable_fp_fusion=False
+    )
+    return out

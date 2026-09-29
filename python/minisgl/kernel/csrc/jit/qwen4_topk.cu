@@ -206,6 +206,84 @@ __device__ __forceinline__ void radix_select_topk(const float* __restrict__ inpu
   }
 }
 
+// Stable block scan for deterministic collection in increasing token order.
+__device__ __forceinline__ int exclusive_count(bool value, int* warp_offsets, int& total) {
+  const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+  const unsigned ballot = __ballot_sync(0xffffffff, value);
+  if (lane == 0) warp_offsets[warp] = __popc(ballot);
+  __syncthreads();
+  if (warp == 0) {
+    const int own = warp_offsets[lane];
+    int sum = own;
+    #pragma unroll
+    for (int offset = 1; offset < 32; offset *= 2) {
+      const int previous = __shfl_up_sync(0xffffffff, sum, offset);
+      if (lane >= offset) sum += previous;
+    }
+    warp_offsets[lane] = sum - own;
+    if (lane == 31) total = sum;
+  }
+  __syncthreads();
+  return warp_offsets[warp] + __popc(ballot & ((1u << lane) - 1));
+}
+
+template <int kTopK>
+__global__ __launch_bounds__(kThreadsPerBlock) void stable_topk_kernel(
+    const FastTopKParams __grid_constant__ params) {
+  const int row = blockIdx.x, tid = threadIdx.x;
+  const int length = params.lengths[row];
+  auto* output = params.indices + int64_t(row) * kTopK;
+  const auto* scores = params.input + int64_t(row) * params.input_stride + params.row_starts[row];
+  if (length <= kTopK) {
+    naive_topk<kTopK>(output, length);
+    return;
+  }
+  __shared__ int histogram[256], remaining, offsets[32], total, tie_base, output_base;
+  __shared__ uint32_t prefix;
+  if (tid == 0) { prefix = 0; remaining = kTopK; tie_base = 0; output_base = 0; }
+  __syncthreads();
+  // Determine the exact kth FP32 key. Scan all matching keys instead of a
+  // bounded candidate array: large equal-score bins must never be truncated.
+  #pragma unroll
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    if (tid < 256) histogram[tid] = 0;
+    __syncthreads();
+    const uint32_t mask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
+    for (int i = tid; i < length; i += kThreadsPerBlock) {
+      const uint32_t key = convert_to_uint32(scores[i]);
+      if ((key & mask) == prefix) atomicAdd(&histogram[(key >> shift) & 255], 1);
+    }
+    __syncthreads();
+    if (tid == 0) {
+      int k = remaining;
+      for (int bin = 255; bin >= 0; --bin) {
+        if (k <= histogram[bin]) {
+          prefix |= uint32_t(bin) << shift;
+          remaining = k;
+          break;
+        }
+        k -= histogram[bin];
+      }
+    }
+    __syncthreads();
+  }
+  for (int base = 0; base < length; base += kThreadsPerBlock) {
+    const int i = base + tid;
+    const uint32_t key = i < length ? convert_to_uint32(scores[i]) : 0u;
+    const bool tied = i < length && key == prefix;
+    const int tie_rank = exclusive_count(tied, offsets, total);
+    const int ties = total;
+    const bool selected = i < length && (key > prefix || (tied && tie_base + tie_rank < remaining));
+    // Every thread has consumed the first scan before its scratch is reused.
+    __syncthreads();
+    const int rank = exclusive_count(selected, offsets, total);
+    if (selected) output[output_base + rank] = i;
+    __syncthreads();
+    if (tid == 0) { tie_base += ties; output_base += total; }
+    __syncthreads();
+  }
+}
+
 template <int kTopK, bool kUsePDL>
 __global__ __launch_bounds__(fast_topk_detail::kThreadsPerBlock) void fast_topk_kernel(
     const fast_topk_detail::FastTopKParams __grid_constant__ params) {
@@ -229,6 +307,19 @@ __global__ __launch_bounds__(fast_topk_detail::kThreadsPerBlock) void fast_topk_
 }  // namespace fast_topk_detail
 
 struct Qwen4FastTopK {
+  static void stable(tvm::ffi::TensorView score, tvm::ffi::TensorView starts,
+                     tvm::ffi::TensorView indices, tvm::ffi::TensorView lengths) {
+    const auto params = fast_topk_detail::FastTopKParams{
+      .input = static_cast<const float*>(score.data_ptr()),
+      .row_starts = static_cast<const int32_t*>(starts.data_ptr()),
+      .indices = static_cast<int32_t*>(indices.data_ptr()),
+      .lengths = static_cast<const int32_t*>(lengths.data_ptr()),
+      .input_stride = score.stride(0),
+    };
+    host::LaunchKernel(score.size(0), fast_topk_detail::kThreadsPerBlock, score.device())(
+        fast_topk_detail::stable_topk_kernel<512>, params);
+  }
+
   static void run(tvm::ffi::TensorView score, tvm::ffi::TensorView starts,
                   tvm::ffi::TensorView indices, tvm::ffi::TensorView lengths) {
     const auto params = fast_topk_detail::FastTopKParams{

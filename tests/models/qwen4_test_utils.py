@@ -23,7 +23,7 @@ def _stable_index_topk(S, L, O, WIDTH: tl.constexpr, STRIDE: tl.constexpr, N: tl
     tl.store(O + row * 512 + col, tl.where(col < length, index, -1), col < 512)
 
 
-def index_topk_deterministic(scores, lengths):
+def index_topk_deterministic(scores, lengths, **_kwargs):
     """Controlled accuracy-test policy, independent of the stock radix selector."""
     n = max(512, tr.next_power_of_2(scores.shape[1]))
     if n > 8192:

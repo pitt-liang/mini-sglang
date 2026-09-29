@@ -1,8 +1,8 @@
 """Native BF16 text path for Qwen3.8-Flash-Next (Qwen4Exp).
 
-Explicit per-model execution policy, native graph decode, GPU-resident PLE and TP.
+Explicit per-model policy, native graph decode, GPU/UVA PLE lookup overlap and TP.
 Each layer owns its eager/legacy/aligned forwards; classes are never replaced.
-Visual inputs, MTP, quantization and prefix snapshots are not enabled.
+Visual inputs, MTP and quantization are not enabled.
 """
 
 import math
@@ -24,6 +24,19 @@ from minisgl.layers.embedding import ParallelLMHead, VocabParallelEmbedding
 
 from .base import BaseLLMModel
 from .qwen4_ops import causal_conv, l2_norm, ngram_ids, rms_norm, rotary
+
+
+def _prefill_linear(ctx):
+    if getattr(ctx.kv_cache, "stable_numerics", False) and ctx.batch.is_prefill:
+        return ops.linear_stable
+    return F.linear
+
+
+def _output_projection(layer, x, linear):
+    if linear is F.linear:
+        return layer.forward(x)
+    output = linear(x, layer.weight)
+    return layer._comm.all_reduce(output) if layer._tp_size > 1 else output
 
 
 class Weight(BaseOP):
@@ -75,7 +88,21 @@ class GatedResidual(BaseOP):
             return self._forward_eager(residual)
         if self.runtime.aligned:
             normed = ops.grouped_norm(residual, self.hc_norm.weight, self.h, self.eps)
-            if normed.shape[0] <= 24:
+            # Cache hits change GEMM row counts. Both cuBLAS and the fused
+            # small-row HC path can then choose different reduction orders.
+            ctx = get_global_ctx()
+            stable_prefill = (
+                getattr(ctx.kv_cache, "stable_numerics", False) and ctx.batch.is_prefill
+            )
+            if stable_prefill:
+                mixed = ops.gr_project_mix_stable(
+                    normed,
+                    self.input_mix_weight_down.weight,
+                    self.input_mix_weight_up.weight,
+                    self.n,
+                    self.h,
+                )
+            elif normed.shape[0] <= 24:
                 if hasattr(self, "_sg_up"):
                     from minisgl.kernel._qwen4_cute.hc_mix import hc_mix
 
@@ -244,13 +271,16 @@ class GatedDeltaNet(BaseOP):
 
         ctx = get_global_ctx()
         m, pool = ctx.batch.attn_metadata, ctx.kv_cache
-        # SGLang packs QKV/Z/B/A, and uses two GEMMs beyond 1024 tokens.
-        if x.shape[0] <= 1024:
+        # Preserve the long-prefill QKV/Z and B/A GEMM boundaries even for a
+        # short cache-hit suffix. Decode retains the single packed GEMM.
+        stable_prefill = getattr(pool, "stable_numerics", False) and ctx.batch.is_prefill
+        linear = _prefill_linear(ctx)
+        if not stable_prefill and x.shape[0] <= 1024:
             projected = F.linear(x, self._packed)
         else:
             cut = self._widths[0] + self._widths[1]
             projected = torch.cat(
-                (F.linear(x, self._packed[:cut]), F.linear(x, self._packed[cut:])), -1
+                (linear(x, self._packed[:cut]), linear(x, self._packed[cut:])), -1
             )
         qkv, z, b, a = projected.split(self._widths, -1)
         z = z.reshape(-1, self.hv, self.dv)
@@ -283,6 +313,9 @@ class GatedDeltaNet(BaseOP):
             initial = torch.tensor(
                 [cached > 0 for _, cached, _, _, _ in m.spans], device=x.device, dtype=torch.bool
             )
+            tracking = pool.track_states if m.track_offsets else None
+            if tracking is not None:
+                tracking.capture_window("conv", self.layer_id, qkv, m)
             mixed = causal_conv1d_fn(
                 qkv.T,
                 weight,
@@ -307,10 +340,21 @@ class GatedDeltaNet(BaseOP):
                 initial_state_indices=m.slots,
                 cu_seqlens=m.cu_seqlens,
                 use_qk_l2norm_in_kernel=True,
+                track_state=tracking.recurrent[self.layer_id] if tracking is not None else None,
+                track_chunk_idx=m.track_chunk_idx,
             )
+            if tracking is not None:
+                # The tracking hook records chunk *starts*. An exact forward
+                # end is instead copied from the final FP32 working state.
+                for row, (offset, span) in enumerate(zip(m.track_offsets, m.spans)):
+                    slot, cached, end, _, _ = span
+                    if offset and offset == end - cached:
+                        tracking.recurrent[self.layer_id][row].copy_(state[slot])
             output = output[0]
-        return self.out_proj.forward(
-            ops.gdn_output(output, z, self.norm.weight, self.eps).flatten(1)
+        return _output_projection(
+            self.out_proj,
+            ops.gdn_output(output, z, self.norm.weight, self.eps, stable=stable_prefill).flatten(1),
+            linear,
         )
 
 
@@ -378,10 +422,11 @@ class QSAAttention(BaseOP):
             return self._forward_eager(x)
         ctx, rc = get_global_ctx(), self.config.rotary_config
         pos = ctx.batch.positions
+        linear = _prefill_linear(ctx)
         if self.runtime.aligned:
             cut = sum(self._widths[:3])
-            qg, k, v = F.linear(x, self._packed[:cut]).split(self._widths[:3], -1)
-            iqk = F.linear(x, self._packed[cut:])
+            qg, k, v = linear(x, self._packed[:cut]).split(self._widths[:3], -1)
+            iqk = linear(x, self._packed[cut:])
         else:
             qg, k, v, iqk = F.linear(x, self._packed).split(self._widths, -1)
         q, gate = qg.reshape(-1, self.hq, 2 * self.dim).chunk(2, -1)
@@ -412,7 +457,7 @@ class QSAAttention(BaseOP):
             iq = norm(iq, ix.q_layernorm.weight)
         out = ctx.attn_backend.qsa(q, k, v, iq, ik, ix.k_layernorm.weight, self.layer_id)
         if self.runtime.aligned:
-            return self.o_proj.forward(ops.sigmoid_mul(out, gate).flatten(1))
+            return _output_projection(self.o_proj, ops.sigmoid_mul(out, gate).flatten(1), linear)
         return self.o_proj.forward((out * gate.sigmoid()).flatten(1))
 
 
@@ -456,14 +501,21 @@ class SparseMoE(BaseOP):
             from minisgl.moe.fused import fused_experts_impl
 
             # The routed backend writes its result into its input buffer.
+            linear = _prefill_linear(get_global_ctx())
             original = x.clone()
-            shared = silu_and_mul(F.linear(x, self._packed))
-            shared = F.linear(shared, self.shared_expert.down_proj.weight)
-            weights, ids = ops.router(self.gate.forward(x), self.experts.top_k)
+            shared = silu_and_mul(linear(x, self._packed))
+            shared = linear(shared, self.shared_expert.down_proj.weight)
+            weights, ids = ops.router(linear(x, self.gate.weight), self.experts.top_k)
             routed = fused_experts_impl(
                 x, self.experts.gate_up_proj, self.experts.down_proj, weights, ids
             )
-            output = ops.moe_combine(original, self.shared_expert_gate.weight, shared, routed)
+            output = ops.moe_combine(
+                original,
+                self.shared_expert_gate.weight,
+                shared,
+                routed,
+                stable=linear is ops.linear_stable,
+            )
             return self.experts._comm.all_reduce(output) if get_tp_info().size > 1 else output
         shared = self.shared_expert
         y, gate = ops.legacy_shared_activation(
@@ -483,15 +535,44 @@ class SparseMoE(BaseOP):
 
 
 class NGramTable(VocabParallelEmbedding):
-    def forward(self, ids):
+    def initialize_runtime(self, device):
+        if device.type == "cuda" and (
+            self.weight.dtype != torch.bfloat16 or not self.weight.is_contiguous()
+        ):
+            raise ValueError("Qwen4 PLE lookup requires a contiguous BF16 table")
+        self._host_pointer = (
+            ops.ple_host_pointer(self.weight, device)
+            if self.weight.device.type == "cpu" and device.type == "cuda"
+            else None
+        )
+
+    def lookup_local(self, ids, out=None):
         # PLE's 160 BF16 values/row are not supported by the generic warp-copy
         # embedding kernel (320 bytes is not a multiple of 128 bytes).
         start, count = self.vocab_range
+        if ids.is_cuda:
+            shape = (ids.numel(), self.weight.shape[1])
+            if self.weight.is_cuda and self.weight.device != ids.device:
+                raise ValueError("PLE table and IDs must be on the same CUDA device")
+            if out is None:
+                out = torch.empty(shape, device=ids.device, dtype=self.weight.dtype)
+            elif out.shape != shape:
+                raise ValueError(f"PLE lookup output shape must be {shape}")
+            pointer = self.weight.data_ptr() if self.weight.is_cuda else self._host_pointer
+            return ops.ple_lookup(pointer, ids, out, start, count)
         local = ids.long() - start
         valid = (local >= 0) & (local < count)
-        out = F.embedding(local.clamp(0, count - 1), self.weight)
-        out = out * valid[:, None]
+        result = F.embedding(local.clamp(0, count - 1), self.weight) * valid[:, None]
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
+
+    def reduce_embeddings(self, out):
         return self._comm.all_reduce(out) if self.tp_size > 1 else out
+
+    def forward(self, ids):
+        return self.reduce_embeddings(self.lookup_local(ids))
 
 
 class NGramEmbedding(BaseOP):
@@ -525,10 +606,32 @@ class PLE(BaseOP):
         self.value_proj = LinearReplicated(c["ple_embed_dim"], config.hidden_size, False)
         self.norm_key, self.norm_query, self.norm_conv = Weight(width), Weight(width), Weight(width)
         self.conv1d = Weight(width, 1, c["ple_conv_kernel_size"])
+        self._prefetch_stream = None
+        self._prefetch_buffers = {}
+        self._prefetch_state = None
 
-    def _forward_eager(self, residual):
+    def initialize_runtime(self, device):
+        self.ple_embedding.ngram_embedding.initialize_runtime(device)
+        if self.runtime.ple_prefetch:
+            self._prefetch_stream = torch.cuda.Stream(device=device)
+
+    def prepare_ids(self):
+        """Advance token history exactly once, whether lookup is prefetched or not."""
         ctx, cfg = get_global_ctx(), self.config
         c, pe = cfg.hybrid, self.ple_embedding
+        if self.runtime.enabled(ctx.batch.input_ids) and not ctx.batch.is_prefill:
+            m = ctx.batch.attn_metadata
+            return ops.hash_decode(
+                ctx.batch.input_ids,
+                ctx.kv_cache.ple_history[self.layer_id],
+                pe.layer_multipliers,
+                pe.ngram_heads_vocab_sizes,
+                pe.ngram_heads_offsets,
+                pe.heads,
+                c["eos_token_id"],
+                m.slots,
+                m.valid,
+            ).flatten()
         ids = []
         for slot, _, _, a, b in ctx.batch.attn_metadata.spans:
             ids.append(
@@ -542,8 +645,47 @@ class PLE(BaseOP):
                     c["eos_token_id"],
                 )
             )
-        hashed = torch.cat(ids)
-        embeddings = pe.ngram_embedding.forward(hashed.flatten()).view(residual.shape[0], -1)
+        return torch.cat(ids).flatten()
+
+    def start_prefetch(self):
+        if self._prefetch_stream is None:
+            return
+        if self._prefetch_state is not None:
+            raise RuntimeError("PLE prefetch must be consumed before reuse")
+        ids = self.prepare_ids()
+        table = self.ple_embedding.ngram_embedding
+        # Captured outputs need stable addresses. Eager prefill/decode share one
+        # growable buffer, avoiding quadratic retention across batch sizes.
+        key = ids.numel() if torch.cuda.is_current_stream_capturing() else "eager"
+        buffer = self._prefetch_buffers.get(key)
+        if buffer is None or buffer.shape[0] < ids.numel():
+            buffer = torch.empty(
+                (ids.numel(), table.weight.shape[1]), device=ids.device, dtype=table.weight.dtype
+            )
+            self._prefetch_buffers[key] = buffer
+        output = buffer[: ids.numel()]
+        stream = self._prefetch_stream
+        stream.wait_stream(torch.cuda.current_stream())
+        ids.record_stream(stream)
+        with torch.cuda.stream(stream):
+            table.lookup_local(ids, out=output)
+        self._prefetch_state = output
+
+    def consume_embeddings(self):
+        table = self.ple_embedding.ngram_embedding
+        if self._prefetch_state is None:
+            return table.forward(self.prepare_ids())
+        torch.cuda.current_stream().wait_stream(self._prefetch_stream)
+        output = self._prefetch_state
+        self._prefetch_state = None
+        # Collectives must stay ordered on the model stream: the communication
+        # backend shares its workspace with attention and MoE.
+        return table.reduce_embeddings(output)
+
+    def _forward_eager(self, residual):
+        ctx, cfg = get_global_ctx(), self.config
+        c = cfg.hybrid
+        embeddings = self.consume_embeddings().view(residual.shape[0], -1)
         h, n, eps = cfg.hidden_size, c["hc_count"], cfg.rms_norm_eps
 
         norm = rms_norm
@@ -553,12 +695,19 @@ class PLE(BaseOP):
             def norm(x, w, eps, h):
                 return grouped_norm(x, w, h, eps)
 
-        key = norm(self.key_proj.forward(embeddings), self.norm_key.weight, eps, h).view(-1, n, h)
+        linear = _prefill_linear(ctx)
+        key = norm(linear(embeddings, self.key_proj.weight), self.norm_key.weight, eps, h).view(
+            -1, n, h
+        )
         query = norm(residual, self.norm_query.weight, eps, h).view(-1, n, h)
         gate = (key * query).sum(-1, keepdim=True) / math.sqrt(h)
         gate = gate.sign() * gate.abs().clamp_min(1e-6).sqrt()
-        value = (gate.sigmoid() * self.value_proj.forward(embeddings)[:, None]).flatten(1)
+        value = (gate.sigmoid() * linear(embeddings, self.value_proj.weight)[:, None]).flatten(1)
         normed = norm(value, self.norm_conv.weight, eps, h)
+        if ctx.batch.attn_metadata.track_offsets:
+            ctx.kv_cache.track_states.capture_window(
+                "ple_conv", self.layer_id, normed, ctx.batch.attn_metadata
+            )
         out = torch.empty_like(value)
         for slot, _, _, a, b in ctx.batch.attn_metadata.spans:
             out[a:b] = causal_conv(
@@ -574,19 +723,8 @@ class PLE(BaseOP):
         if not self.runtime.enabled(residual) or ctx.batch.is_prefill:
             return self._forward_eager(residual)
         cfg = self.config
-        c, pe, m = cfg.hybrid, self.ple_embedding, ctx.batch.attn_metadata
-        hashed = ops.hash_decode(
-            ctx.batch.input_ids,
-            ctx.kv_cache.ple_history[self.layer_id],
-            pe.layer_multipliers,
-            pe.ngram_heads_vocab_sizes,
-            pe.ngram_heads_offsets,
-            pe.heads,
-            c["eos_token_id"],
-            m.slots,
-            m.valid,
-        )
-        emb = pe.ngram_embedding.forward(hashed.flatten()).view(residual.shape[0], -1)
+        c, m = cfg.hybrid, ctx.batch.attn_metadata
+        emb = self.consume_embeddings().view(residual.shape[0], -1)
         h, n, eps = cfg.hidden_size, c["hc_count"], cfg.rms_norm_eps
 
         def norm(x, w):
@@ -673,6 +811,9 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
         load_qwen4_weights(self, model_path, device)
         pack_qwen4_weights(self)
+        for layer in self.model.layers.op_list:
+            if layer.ple is not None:
+                layer.ple.initialize_runtime(device)
 
     def forward(self):
         ctx = get_global_ctx()
@@ -680,10 +821,24 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             for slot, cached, _, _, _ in ctx.batch.attn_metadata.spans:
                 if cached == 0:
                     ctx.kv_cache.reset(slot)
+            if ctx.batch.attn_metadata.track_offsets:
+                for row, req in enumerate(ctx.batch.reqs):
+                    if not req.checkpoint_len:
+                        continue
+                    for history in ctx.kv_cache.track_states.ple_history.values():
+                        length, width = req.checkpoint_len, history.shape[-1]
+                        tokens = req.input_ids[max(0, length - width) : length]
+                        history[row].fill_(ctx.kv_cache.eos)
+                        history[row, width - len(tokens) :].copy_(tokens, non_blocking=True)
         residual = self.model.embed_tokens.forward(ctx.batch.input_ids).repeat(
             1, self.config.hybrid["hc_count"]
         )
-        for layer in self.model.layers.op_list:
+        layers = self.model.layers.op_list
+        if layers and layers[0].ple is not None:
+            layers[0].ple.start_prefetch()
+        for i, layer in enumerate(layers):
+            if i + 1 < len(layers) and layers[i + 1].ple is not None:
+                layers[i + 1].ple.start_prefetch()
             residual = layer.forward(residual)
         hidden, _ = self.model.hyper_connection_mixer.forward(residual)
         return self.lm_head.forward(hidden)

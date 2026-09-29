@@ -1,4 +1,4 @@
-"""Token-paged QSA KV and request-slotted recurrent state (no prefix reuse)."""
+"""Token-paged QSA KV and private working / immutable checkpoint state."""
 
 import torch
 from minisgl.distributed import get_tp_info
@@ -98,3 +98,69 @@ class Qwen4KVCache(MHAKVCache):
 
     def store_kv(self, k, v, out_loc, layer_id):
         return super().store_kv(k.flatten(1), v.flatten(1), out_loc, self.layer_map[layer_id])
+
+    def state_tensors(self):
+        # Pending QSA keys are deliberately excluded: reusable checkpoints are
+        # compression-group aligned. Compressed keys share the full-KV pages.
+        return tuple(
+            state
+            for group in (self.recurrent, self.conv, self.ple_conv, self.ple_history)
+            for state in group.values()
+        )
+
+
+class Qwen4StatePool:
+    """Fixed-budget snapshots; allocation/ownership is managed by the radix cache.
+
+    Preserve every source dtype, notably FP32 GDN state. All copies are enqueued
+    on the caller's stream; consumers must obey the checkpoint's ready event.
+    """
+
+    def __init__(self, working, capacity):
+        self.working = working
+        self.capacity = capacity
+        self.tensors = tuple(
+            torch.empty((capacity, *t.shape[1:]), dtype=t.dtype, device=t.device)
+            for t in working.state_tensors()
+        )
+        tensors = iter(self.tensors)
+        for name in ("recurrent", "conv", "ple_conv", "ple_history"):
+            setattr(self, name, {layer: next(tensors) for layer in getattr(working, name)})
+        self.free_slots = list(range(capacity))
+
+    @property
+    def nbytes(self):
+        return sum(t.numel() * t.element_size() for t in self.tensors)
+
+    def allocate(self):
+        return self.free_slots.pop() if self.free_slots else None
+
+    def free(self, slot):
+        assert slot not in self.free_slots, "checkpoint slot freed twice"
+        self.free_slots.append(slot)
+
+    def save(self, source, destination, source_tensors=None):
+        source_tensors = self.working.state_tensors() if source_tensors is None else source_tensors
+        for working, saved in zip(source_tensors, self.tensors):
+            saved[destination].copy_(working[source])
+
+    def restore(self, source, destination):
+        for working, saved in zip(self.working.state_tensors(), self.tensors):
+            working[destination].copy_(saved[source])
+        self.working.pending[:, destination].zero_()
+
+    def capture_window(self, name, layer, inputs, metadata):
+        """Gather a short-conv boundary before the working window is updated."""
+        source = getattr(self.working, name)[layer]
+        target = getattr(self, name)[layer]
+        width = source.shape[-1]
+        for row, (offset, span) in enumerate(zip(metadata.track_offsets, metadata.spans)):
+            if not offset:
+                continue
+            slot, _, _, start, _ = span
+            if offset >= width:
+                target[row].copy_(inputs[start + offset - width : start + offset].T)
+            else:
+                target[row].copy_(
+                    torch.cat((source[slot, :, offset:], inputs[start : start + offset].T), -1)
+                )

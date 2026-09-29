@@ -169,6 +169,16 @@ def main():
                 "controlled_topk": True,
                 "steps": args.steps,
                 "rank": rank,
+                "runtime": asdict(engine.model.runtime),
+                "ple_tables": [
+                    {
+                        "layer": layer.ple.layer_id,
+                        "device": str(layer.ple.ple_embedding.ngram_embedding.weight.device),
+                        "pinned": layer.ple.ple_embedding.ngram_embedding.weight.is_pinned(),
+                    }
+                    for layer in engine.model.model.layers.op_list
+                    if layer.ple is not None
+                ],
                 "cases": [],
             }
             for bs, length in ((1, 5), (1, 128), (1, 2053), (3, 7)):

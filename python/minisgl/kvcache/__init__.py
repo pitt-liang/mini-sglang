@@ -63,6 +63,13 @@ def create_radix_cache(device: torch.device):
     return RadixPrefixCache(device=device)
 
 
+@SUPPORTED_CACHE_MANAGER.register("hybrid")
+def create_hybrid_cache(device: torch.device):
+    from .hybrid_cache import HybridPrefixCache
+
+    return HybridPrefixCache(device=device)
+
+
 def create_prefix_cache(device: torch.device, type: str) -> BasePrefixCache:
     return SUPPORTED_CACHE_MANAGER[type](device)
 

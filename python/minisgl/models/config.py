@@ -19,15 +19,26 @@ class Qwen4RuntimeConfig:
 
     reference: bool = False
     aligned: bool | None = None
+    ple_storage: str = "gpu"
+    ple_prefetch: bool = False
+
+    def __post_init__(self):
+        if self.ple_storage not in ("gpu", "pinned"):
+            raise ValueError("Qwen4 PLE storage must be gpu or pinned")
 
     @classmethod
     def from_env(cls):
         requested = os.environ.get("MINISGL_QWEN4_SGLANG_NUMERICS")
         if requested not in (None, "0", "1"):
             raise ValueError("MINISGL_QWEN4_SGLANG_NUMERICS must be 0 or 1")
+        prefetch = os.environ.get("MINISGL_QWEN4_PLE_PREFETCH", "0")
+        if prefetch not in ("0", "1"):
+            raise ValueError("MINISGL_QWEN4_PLE_PREFETCH must be 0 or 1")
         return cls(
             reference=os.environ.get("MINISGL_QWEN4_REFERENCE", "0") == "1",
             aligned=None if requested is None else requested == "1",
+            ple_storage=os.environ.get("MINISGL_QWEN4_PLE_STORAGE", "gpu"),
+            ple_prefetch=prefetch == "1",
         )
 
     def resolve(self, device):
@@ -41,6 +52,8 @@ class Qwen4RuntimeConfig:
         )
         if self.aligned is True and not supported:
             raise ValueError("Qwen4 aligned kernels currently require SM100 and CUDA 13+")
+        if device.type != "cuda" and (self.ple_storage == "pinned" or self.ple_prefetch):
+            raise ValueError("Qwen4 PLE offload/prefetch requires a CUDA device")
         return replace(
             self,
             aligned=(supported and not self.reference) if self.aligned is None else self.aligned,

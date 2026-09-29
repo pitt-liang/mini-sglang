@@ -14,6 +14,30 @@ from minisgl.models.config import Qwen4RuntimeConfig
 
 
 class TestNumericsSelection(unittest.TestCase):
+    def test_ple_storage_and_prefetch_are_independent_validated_policies(self):
+        with patch.dict(os.environ, {}, clear=True):
+            default = Qwen4RuntimeConfig.from_env()
+            self.assertEqual(default.ple_storage, "gpu")
+            self.assertFalse(default.ple_prefetch)
+            for storage in ("gpu", "pinned"):
+                for prefetch in ("0", "1"):
+                    os.environ.update(
+                        MINISGL_QWEN4_PLE_STORAGE=storage, MINISGL_QWEN4_PLE_PREFETCH=prefetch
+                    )
+                    policy = Qwen4RuntimeConfig.from_env()
+                    self.assertEqual(policy.ple_storage, storage)
+                    self.assertEqual(policy.ple_prefetch, prefetch == "1")
+                    if storage == "pinned" or prefetch == "1":
+                        with self.assertRaises(ValueError):
+                            policy.resolve(torch.device("cpu"))
+            os.environ["MINISGL_QWEN4_PLE_PREFETCH"] = "invalid"
+            with self.assertRaises(ValueError):
+                Qwen4RuntimeConfig.from_env()
+            os.environ["MINISGL_QWEN4_PLE_PREFETCH"] = "0"
+            os.environ["MINISGL_QWEN4_PLE_STORAGE"] = "file"
+            with self.assertRaises(ValueError):
+                Qwen4RuntimeConfig.from_env()
+
     def test_default_and_explicit_override(self):
         with (
             patch.dict(os.environ, {}, clear=False),
@@ -515,8 +539,9 @@ class TestSGLangNumerics(unittest.TestCase):
             valid=torch.ones(1, device="cuda", dtype=torch.bool),
             spans=((2, 0, 5, 0, 5),),
             cu_seqlens=torch.tensor([0, 5], device="cuda", dtype=torch.int32),
+            track_offsets=(),
         )
-        batch = SimpleNamespace(is_decode=False, attn_metadata=meta)
+        batch = SimpleNamespace(is_decode=False, is_prefill=True, attn_metadata=meta)
         ctx = SimpleNamespace(batch=batch, kv_cache=pool)
         op = SimpleNamespace(
             _packed=self.tensor(8240, 32) * 0.03,
@@ -538,6 +563,7 @@ class TestSGLangNumerics(unittest.TestCase):
             self.assertEqual(out.shape, (5, 3072))
             self.assertTrue(torch.isfinite(out).all())
             batch.is_decode = True
+            batch.is_prefill = False
             out = GatedDeltaNet.forward_aligned(op, self.tensor(1, 32))
             self.assertEqual(out.shape, (1, 3072))
             self.assertTrue(torch.isfinite(out).all())
