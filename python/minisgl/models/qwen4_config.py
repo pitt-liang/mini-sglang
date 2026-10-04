@@ -1,15 +1,13 @@
-"""Typed Qwen4 text architecture and immutable, per-model execution options."""
+"""Typed Qwen4 text architecture, independent of the inference environment."""
 
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Literal, cast
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal
 
 from .config import ModelConfig
 
 if TYPE_CHECKING:
-    import torch
     from transformers import PretrainedConfig
 
 
@@ -41,12 +39,6 @@ class Qwen4Config(ModelConfig):
     split_ngram_parts: int
     eos_token_id: int
 
-    # Resolved after the engine selects its CUDA device, before weight packing.
-    reference: bool = False
-    aligned: bool | None = None
-    ple_storage: Literal["gpu", "pinned"] = "gpu"
-    ple_prefetch: bool = False
-
     def __post_init__(self) -> None:
         if self.model_type not in ("qwen4_exp", "qwen4_exp_text"):
             raise ValueError("Qwen4Config requires a Qwen4 text model_type")
@@ -54,8 +46,6 @@ class Qwen4Config(ModelConfig):
             raise ValueError("Qwen4 requires one layer_types entry per decoder layer")
         if set(self.layer_types) - {"linear_attention", "full_attention"}:
             raise ValueError("Unsupported Qwen4 layer type")
-        if self.ple_storage not in ("gpu", "pinned"):
-            raise ValueError("Qwen4 PLE storage must be gpu or pinned")
 
     @property
     def is_qwen4(self) -> bool:
@@ -106,45 +96,4 @@ class Qwen4Config(ModelConfig):
             make_ngram_vocab_size_divisible_by=config.make_ngram_vocab_size_divisible_by,
             split_ngram_parts=config.split_ngram_parts,
             eos_token_id=config.eos_token_id,
-        ).with_env_overrides()
-
-    def with_env_overrides(self) -> Qwen4Config:
-        """Read execution options once, without querying/initializing CUDA."""
-        requested = os.environ.get("MINISGL_QWEN4_SGLANG_NUMERICS")
-        if requested not in (None, "0", "1"):
-            raise ValueError("MINISGL_QWEN4_SGLANG_NUMERICS must be 0 or 1")
-        prefetch = os.environ.get("MINISGL_QWEN4_PLE_PREFETCH", "0")
-        if prefetch not in ("0", "1"):
-            raise ValueError("MINISGL_QWEN4_PLE_PREFETCH must be 0 or 1")
-        storage = os.environ.get("MINISGL_QWEN4_PLE_STORAGE", "gpu")
-        if storage not in ("gpu", "pinned"):
-            raise ValueError("Qwen4 PLE storage must be gpu or pinned")
-        return replace(
-            self,
-            reference=os.environ.get("MINISGL_QWEN4_REFERENCE", "0") == "1",
-            aligned=None if requested is None else requested == "1",
-            ple_storage=cast(Literal["gpu", "pinned"], storage),
-            ple_prefetch=prefetch == "1",
         )
-
-    def resolve_runtime(self, device: torch.device) -> Qwen4Config:
-        """Return a new config; never mutate an existing model's kernel policy."""
-        import torch
-
-        supported = (
-            device.type == "cuda"
-            and torch.cuda.get_device_capability(device)[0] == 10
-            and torch.version.cuda is not None
-            and int(torch.version.cuda.split(".")[0]) >= 13
-        )
-        if self.aligned is True and not supported:
-            raise ValueError("Qwen4 aligned kernels currently require SM100 and CUDA 13+")
-        if device.type != "cuda" and (self.ple_storage == "pinned" or self.ple_prefetch):
-            raise ValueError("Qwen4 PLE offload/prefetch requires a CUDA device")
-        return replace(
-            self,
-            aligned=(supported and not self.reference) if self.aligned is None else self.aligned,
-        )
-
-    def use_optimized_kernels(self, x: torch.Tensor | None = None) -> bool:
-        return not self.reference and (x is None or x.is_cuda)

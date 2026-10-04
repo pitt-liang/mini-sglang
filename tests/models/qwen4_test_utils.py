@@ -1,14 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Controlled numerical-test utilities; never imported by the model runtime."""
 
+from contextlib import contextmanager
+from unittest.mock import patch
+
 import torch
 import triton as tr
 import triton.language as tl
+from minisgl.core import Context
+from minisgl.env import Qwen4Execution
 from minisgl.models import Qwen4Config, RotaryConfig
 
 
 def make_qwen4_config(**overrides) -> Qwen4Config:
-    """Small, complete typed config; tests opt into environment parsing explicitly."""
+    """Small, complete architecture config, independent of execution flags."""
     values = {
         "num_layers": 4,
         "num_qo_heads": 4,
@@ -54,6 +59,15 @@ def make_qwen4_config(**overrides) -> Qwen4Config:
     }
     values.update(overrides)
     return Qwen4Config(**values)
+
+
+@contextmanager
+def qwen4_execution(**overrides):
+    """Install an isolated worker snapshot while constructing test components."""
+    ctx = Context(1)
+    ctx.qwen4_execution = Qwen4Execution(False, False, "gpu", False)._replace(**overrides)
+    with patch("minisgl.core._GLOBAL_CTX", ctx):
+        yield ctx.qwen4_execution
 
 
 @tr.jit

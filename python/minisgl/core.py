@@ -8,6 +8,7 @@ import torch
 
 if TYPE_CHECKING:
     from minisgl.attention import BaseAttnBackend, BaseAttnMetadata
+    from minisgl.env import Qwen4Execution
     from minisgl.kvcache import BaseCacheHandle, BaseKVCachePool
     from minisgl.moe import BaseMoeBackend
 
@@ -101,6 +102,7 @@ class Batch:
 @dataclass
 class Context:
     page_size: int
+    qwen4_execution: Qwen4Execution | None = field(default=None, init=False)
     # NOTE: this table always treat page_size = 1
     page_table: torch.Tensor = field(init=False)
     attn_backend: BaseAttnBackend = field(init=False)
@@ -135,3 +137,10 @@ def set_global_ctx(ctx: Context):
 def get_global_ctx() -> Context:
     assert _GLOBAL_CTX is not None, "Global context is not set"
     return _GLOBAL_CTX
+
+
+def get_qwen4_execution() -> Qwen4Execution:
+    execution = get_global_ctx().qwen4_execution
+    if execution is None:
+        raise RuntimeError("Resolve Qwen4 execution env in the worker before construction")
+    return execution

@@ -9,6 +9,7 @@ import torch
 from minisgl.attention import create_attention_backend
 from minisgl.core import Batch, Context, Req, set_global_ctx
 from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from minisgl.env import Qwen4Execution, resolve_qwen4_execution
 from minisgl.kvcache import create_kvcache_pool
 from minisgl.layers import set_rope_device
 from minisgl.models import Qwen4Config, create_model, load_weight
@@ -32,23 +33,22 @@ class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
-        _adjust_config(config)
-
+        model_config = config.model_config
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
         torch.cuda.set_device(self.device)
-        model_config = config.model_config
-        if isinstance(model_config, Qwen4Config):
-            object.__setattr__(
-                config,
-                "model_config",
-                model_config.resolve_runtime(self.device),
-            )
+        execution = (
+            resolve_qwen4_execution(self.device) if isinstance(model_config, Qwen4Config) else None
+        )
+        _adjust_config(config, execution)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
         self.dtype = config.dtype
         self.ctx = Context(config.page_size)
+        self.ctx.qwen4_execution = execution
         set_global_ctx(self.ctx)
+        if execution is not None:
+            logger.info_rank0(f"Qwen4 execution env: {execution}")
 
         self.tp_cpu_group = self._init_communication(config)
         if config.model_config.is_qwen4 and os.environ.get("MINISGL_QWEN4_MNNVL") == "1":
@@ -90,10 +90,9 @@ class Engine:
             from minisgl.kvcache.qwen4_pool import Qwen4StatePool
 
             self.kv_cache.prefix_states = Qwen4StatePool(self.kv_cache, self.state_cache_slots)
-            model_config = config.model_config
-            assert isinstance(model_config, Qwen4Config)
+            assert execution is not None
             self.kv_cache.internal_checkpoints = (
-                model_config.aligned and model_config.use_optimized_kernels()
+                execution.aligned and execution.use_optimized_kernels()
             )
             if self.kv_cache.internal_checkpoints:
                 self.kv_cache.track_states = Qwen4StatePool(self.kv_cache, config.max_running_req)
@@ -227,7 +226,9 @@ class Engine:
                 if self.state_cache_slots < 1:
                     raise ValueError("Qwen4 state cache budget must fit at least one checkpoint")
                 state_bytes += self.state_cache_slots * per_state
-                if model_config.aligned and model_config.use_optimized_kernels():
+                execution = self.ctx.qwen4_execution
+                assert execution is not None
+                if execution.aligned and execution.use_optimized_kernels():
                     state_bytes += config.max_running_req * per_state
         num_pages = config.num_page_override
         if num_pages is None:
@@ -297,15 +298,17 @@ def _align_up_32(num: int) -> int:
     return (num + 31) // 32 * 32
 
 
-def _adjust_config(config: EngineConfig):
+def _adjust_config(config: EngineConfig, execution: Qwen4Execution | None = None):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
 
     model_config = config.model_config
     if isinstance(model_config, Qwen4Config):
+        if execution is None:
+            raise RuntimeError("Qwen4 engine requires resolved execution env")
         if config.attention_backend not in ("auto", "qwen4"):
             raise ValueError("Qwen4 requires the qwen4 hybrid attention backend")
-        if not model_config.use_optimized_kernels() and (
+        if not execution.use_optimized_kernels() and (
             config.cuda_graph_max_bs not in (None, 0) or config.cuda_graph_bs
         ):
             raise ValueError("Qwen4 eager baseline does not support CUDA graphs")
@@ -313,7 +316,7 @@ def _adjust_config(config: EngineConfig):
             raise ValueError("Qwen4 currently supports BF16 weights only")
         override("attention_backend", "qwen4")
         if config.cuda_graph_max_bs is None and not config.cuda_graph_bs:
-            override("cuda_graph_max_bs", 4 if model_config.use_optimized_kernels() else 0)
+            override("cuda_graph_max_bs", 4 if execution.use_optimized_kernels() else 0)
         if config.page_size == 1:
             override("page_size", model_config.indexer_compress_ratio)
         if hasattr(config, "cache_type"):

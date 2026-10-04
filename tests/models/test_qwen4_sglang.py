@@ -9,14 +9,15 @@ from unittest.mock import patch
 import qwen4_test_utils as oracle
 import torch
 import triton
+from minisgl.env import ENV, resolve_qwen4_execution
 from minisgl.kernel import qwen4_ops as mini
-from qwen4_test_utils import make_qwen4_config
+from qwen4_test_utils import make_qwen4_config, qwen4_execution
 
 
 class TestNumericsSelection(unittest.TestCase):
     def test_ple_storage_and_prefetch_are_independent_validated_policies(self):
         with patch.dict(os.environ, {}, clear=True):
-            default = make_qwen4_config().with_env_overrides()
+            default = resolve_qwen4_execution(torch.device("cpu"))
             self.assertEqual(default.ple_storage, "gpu")
             self.assertFalse(default.ple_prefetch)
             for storage in ("gpu", "pinned"):
@@ -24,19 +25,23 @@ class TestNumericsSelection(unittest.TestCase):
                     os.environ.update(
                         MINISGL_QWEN4_PLE_STORAGE=storage, MINISGL_QWEN4_PLE_PREFETCH=prefetch
                     )
-                    policy = make_qwen4_config().with_env_overrides()
-                    self.assertEqual(policy.ple_storage, storage)
-                    self.assertEqual(policy.ple_prefetch, prefetch == "1")
+                    with (
+                        patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+                        patch("torch.version.cuda", "13.0"),
+                    ):
+                        execution = resolve_qwen4_execution(torch.device("cuda"))
+                    self.assertEqual(execution.ple_storage, storage)
+                    self.assertEqual(execution.ple_prefetch, prefetch == "1")
                     if storage == "pinned" or prefetch == "1":
                         with self.assertRaises(ValueError):
-                            policy.resolve_runtime(torch.device("cpu"))
+                            resolve_qwen4_execution(torch.device("cpu"))
             os.environ["MINISGL_QWEN4_PLE_PREFETCH"] = "invalid"
             with self.assertRaises(ValueError):
-                make_qwen4_config().with_env_overrides()
+                resolve_qwen4_execution(torch.device("cpu"))
             os.environ["MINISGL_QWEN4_PLE_PREFETCH"] = "0"
             os.environ["MINISGL_QWEN4_PLE_STORAGE"] = "file"
             with self.assertRaises(ValueError):
-                make_qwen4_config().with_env_overrides()
+                resolve_qwen4_execution(torch.device("cpu"))
 
     def test_default_and_explicit_override(self):
         with (
@@ -46,53 +51,60 @@ class TestNumericsSelection(unittest.TestCase):
         ):
             os.environ.pop("MINISGL_QWEN4_REFERENCE", None)
             os.environ.pop("MINISGL_QWEN4_SGLANG_NUMERICS", None)
-            auto = make_qwen4_config().with_env_overrides()
-            self.assertIsNone(auto.aligned)
-            first = auto.resolve_runtime(torch.device("cuda"))
+            self.assertIsNone(ENV.QWEN4_SGLANG_NUMERICS.read())
+            first = resolve_qwen4_execution(torch.device("cuda"))
             self.assertTrue(first.aligned)
             os.environ["MINISGL_QWEN4_SGLANG_NUMERICS"] = "0"
-            second = make_qwen4_config().with_env_overrides().resolve_runtime(torch.device("cuda"))
+            second = resolve_qwen4_execution(torch.device("cuda"))
             self.assertFalse(second.aligned)
             self.assertTrue(first.aligned)  # another model cannot change this policy
             os.environ["MINISGL_QWEN4_SGLANG_NUMERICS"] = "1"
             with self.assertRaises(ValueError):
-                make_qwen4_config().with_env_overrides().resolve_runtime(torch.device("cpu"))
+                resolve_qwen4_execution(torch.device("cpu"))
 
     def test_reference_and_unsupported_device(self):
         with patch.dict(os.environ, {"MINISGL_QWEN4_REFERENCE": "1"}, clear=True):
-            reference = (
-                make_qwen4_config().with_env_overrides().resolve_runtime(torch.device("cpu"))
-            )
+            reference = resolve_qwen4_execution(torch.device("cpu"))
         self.assertFalse(reference.use_optimized_kernels())
         self.assertFalse(reference.aligned)
         with (
             patch("torch.cuda.get_device_capability", return_value=(9, 0)),
             patch("torch.version.cuda", "13.0"),
         ):
-            legacy = make_qwen4_config().resolve_runtime(torch.device("cuda"))
+            legacy = resolve_qwen4_execution(torch.device("cuda"))
         self.assertTrue(legacy.use_optimized_kernels())
         self.assertFalse(legacy.aligned)
 
     def test_policy_is_frozen_and_env_read_does_not_initialize_cuda(self):
-        from dataclasses import FrozenInstanceError
-
-        with patch("torch.cuda.get_device_capability", side_effect=AssertionError("CUDA queried")):
-            policy = make_qwen4_config().with_env_overrides()
-        with self.assertRaises(FrozenInstanceError):
-            policy.aligned = False
-        with patch.dict(os.environ, {"MINISGL_QWEN4_SGLANG_NUMERICS": "invalid"}):
-            with self.assertRaises(ValueError):
-                make_qwen4_config().with_env_overrides()
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("torch.cuda.get_device_capability", side_effect=AssertionError("CUDA queried")),
+        ):
+            self.assertIsNone(ENV.QWEN4_SGLANG_NUMERICS.read())
+            execution = resolve_qwen4_execution(torch.device("cpu"))
+        with self.assertRaises(AttributeError):
+            execution.aligned = True
+        for name in ("REFERENCE", "SGLANG_NUMERICS", "PLE_STORAGE", "PLE_PREFETCH"):
+            key = "MINISGL_QWEN4_" + name
+            with self.subTest(flag=key), patch.dict(os.environ, {key: "invalid"}, clear=True):
+                with self.assertRaisesRegex(ValueError, key):
+                    resolve_qwen4_execution(torch.device("cpu"))
 
     def test_backend_policies_are_independent(self):
         from minisgl.attention.qwen4 import Qwen4Backend
+        from minisgl.core import Context
 
-        first = Qwen4Backend(make_qwen4_config(aligned=True))
-        second = Qwen4Backend(make_qwen4_config(aligned=False))
-        self.assertTrue(first.config.aligned)
-        self.assertFalse(second.config.aligned)
-        with self.assertRaises(ValueError):
-            Qwen4Backend(make_qwen4_config())
+        config = make_qwen4_config()
+        with qwen4_execution(aligned=True):
+            first = Qwen4Backend(config)
+        with qwen4_execution():
+            second = Qwen4Backend(config)
+        self.assertIs(first.config, second.config)
+        self.assertTrue(first.execution.aligned)
+        self.assertFalse(second.execution.aligned)
+        with patch("minisgl.core._GLOBAL_CTX", Context(1)):
+            with self.assertRaises(RuntimeError):
+                Qwen4Backend(config)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -348,7 +360,8 @@ class TestSGLangNumerics(unittest.TestCase):
 
         selected = torch.arange(8, device="cuda").repeat(5, 1)
         lengths = torch.tensor([1, 3, 4, 7, 19], device="cuda")
-        backend = Qwen4Backend(make_qwen4_config(aligned=True))
+        with qwen4_execution(aligned=True):
+            backend = Qwen4Backend(make_qwen4_config())
         indices = backend.expand(selected, lengths // 4, lengths, None, 4)
         for row, length in enumerate(lengths.tolist()):
             torch.testing.assert_close(

@@ -14,7 +14,7 @@ from minisgl.models.config import ModelConfig, RotaryConfig
 from minisgl.models.qwen4_config import Qwen4Config
 from minisgl.models.qwen4_ops import causal_conv, l2_norm, ngram_ids, rms_norm, rotary
 from minisgl.utils.hf import cached_load_hf_config
-from qwen4_test_utils import make_qwen4_config
+from qwen4_test_utils import make_qwen4_config, qwen4_execution
 
 
 def independent_hf_reference():
@@ -70,7 +70,7 @@ class Qwen4OpsTest(unittest.TestCase):
         ):
             with self.subTest(cache=cache, requested=requested):
                 config = SimpleNamespace(
-                    model_config=make_qwen4_config(reference=True, aligned=False),
+                    model_config=make_qwen4_config(),
                     attention_backend="auto",
                     moe_backend="fused",
                     dtype=torch.bfloat16,
@@ -81,8 +81,11 @@ class Qwen4OpsTest(unittest.TestCase):
                     qwen4_checkpoint_interval=4096,
                     qwen4_stable_numerics=requested,
                 )
-                with patch("minisgl.engine.engine.logger"):
-                    _adjust_config(config)
+                with (
+                    patch("minisgl.engine.engine.logger"),
+                    qwen4_execution(reference=True) as execution,
+                ):
+                    _adjust_config(config, execution)
                 self.assertEqual(config.qwen4_stable_numerics, expected)
 
     def test_overlap_length_uses_committed_tokens(self):
@@ -136,8 +139,8 @@ class Qwen4OpsTest(unittest.TestCase):
         req = SimpleNamespace(table_idx=3, cached_len=5, device_len=9, extend_len=4)
         batch = SimpleNamespace(reqs=[req])
         ctx = SimpleNamespace(kv_cache=SimpleNamespace(device="cpu"))
-        with patch("minisgl.attention.qwen4.get_global_ctx", return_value=ctx):
-            Qwen4Backend(make_qwen4_config(aligned=False)).prepare_metadata(batch)
+        with patch("minisgl.attention.qwen4.get_global_ctx", return_value=ctx), qwen4_execution():
+            Qwen4Backend(make_qwen4_config()).prepare_metadata(batch)
         req.cached_len, req.device_len = 9, 10
         self.assertEqual(batch.attn_metadata.spans, ((3, 5, 9, 0, 4),))
         self.assertEqual(batch.attn_metadata.last_indices.tolist(), [3])
@@ -162,14 +165,13 @@ class Qwen4OpsTest(unittest.TestCase):
         ref = independent_hf_reference()
         torch.manual_seed(5)
         cfg = make_qwen4_config(
-            reference=True,
-            aligned=False,
             hidden_size=32,
             hc_count=4,
             hc_lowrank=8,
             rms_norm_eps=1e-6,
         )
-        mine = GatedResidual(cfg)
+        with qwen4_execution(reference=True):
+            mine = GatedResidual(cfg)
         golden = ref["Qwen4ExpTextGatedResidual"](cfg)
         for name, value in golden.state_dict().items():
             value.normal_(0, 0.1)
@@ -284,7 +286,6 @@ class Qwen4OpsTest(unittest.TestCase):
             "eos_token_id": 17,
         }
         cfg = make_qwen4_config(
-            aligned=False,
             **c,
             num_kv_heads=2,
             num_layers=1,
@@ -308,7 +309,8 @@ class Qwen4OpsTest(unittest.TestCase):
             .int()
         )
         ctx = SimpleNamespace(kv_cache=pool, page_table=table)
-        backend = Qwen4Backend(cfg)
+        with qwen4_execution():
+            backend = Qwen4Backend(cfg)
         n = 13
         q = torch.randn(n, 4, 32, device="cuda")
         k, v = [torch.randn(n, 2, 32, device="cuda") for _ in range(2)]
@@ -428,7 +430,7 @@ class Qwen4PackingTest(unittest.TestCase):
                     shared_expert=SimpleNamespace(gate_proj=projection(5), up_proj=projection(6))
                 )
                 model = SimpleNamespace(
-                    config=make_qwen4_config(aligned=aligned),
+                    config=make_qwen4_config(),
                     model=SimpleNamespace(
                         layers=SimpleNamespace(
                             op_list=[SimpleNamespace(linear_attn=attn, self_attn=None, mlp=mlp)]
@@ -436,7 +438,11 @@ class Qwen4PackingTest(unittest.TestCase):
                     ),
                 )
                 # Isolate projection layout from the SM100-specific HC permutation.
-                with patch("torch.cuda.get_device_capability", return_value=(9, 0)):
+                with (
+                    patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+                    qwen4_execution(aligned=aligned) as execution,
+                ):
+                    model.execution = execution
                     pack_qwen4_weights(model)
                 expected = [1, 1, 1, 2, 2] + ([4, 3] if aligned else [3, 4])
                 torch.testing.assert_close(attn._packed[:, 0], torch.tensor(expected).float())
@@ -451,10 +457,12 @@ class Qwen4PackingTest(unittest.TestCase):
                 self.assertEqual(attn._packed[-1 if aligned else -2, 0].item(), 9)
 
     def test_unresolved_policy_rejected(self):
-        from minisgl.models.qwen4_weight import pack_qwen4_weights
+        from minisgl.core import Context
+        from minisgl.models.qwen4 import Qwen4ExpForCausalLM
 
-        with self.assertRaises(ValueError):
-            pack_qwen4_weights(SimpleNamespace(config=make_qwen4_config()))
+        with patch("minisgl.core._GLOBAL_CTX", Context(1)):
+            with self.assertRaisesRegex(RuntimeError, "Resolve Qwen4 execution env"):
+                Qwen4ExpForCausalLM(make_qwen4_config())
 
 
 if __name__ == "__main__":

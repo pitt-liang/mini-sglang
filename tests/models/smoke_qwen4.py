@@ -170,7 +170,7 @@ def main():
                 "steps": args.steps,
                 "rank": rank,
                 "runtime": {
-                    key: getattr(engine.model.config, key)
+                    key: getattr(engine.model.execution, key)
                     for key in ("reference", "aligned", "ple_storage", "ple_prefetch")
                 },
                 "ple_tables": [

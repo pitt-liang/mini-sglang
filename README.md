@@ -186,14 +186,23 @@ falls back to the deepest complete checkpoint. Decode state is not published.
 
 Configuration is represented by `Qwen4Config(ModelConfig)` in
 `models/qwen4_config.py`. `ModelConfig.from_hf()` dispatches Qwen4 checkpoints to
-this typed subclass (including nested `text_config`). GDN/QSA/PLE architecture
-fields and the immutable `reference`, `aligned`, `ple_storage`, `ple_prefetch`
-options are direct attributes, not a `hybrid` dictionary or `qwen4_runtime`
-sidecar. The engine resolves automatic device policy with
-`config.resolve_runtime(device)` before constructing the model and packing
-weights. Model layers, attention, and the KV pool consume `Qwen4Config` directly;
-generic models do not carry Qwen4-only fields. Existing environment variables
-and engine/scheduler CLI flags are unchanged.
+this typed subclass (including nested `text_config`). It contains only model
+architecture fields, not execution flags, a `hybrid` dictionary or a
+`qwen4_runtime` sidecar. Parsing HF metadata never reads execution env or queries
+CUDA. Model layers, attention, and the KV pool consume `Qwen4Config` directly;
+generic models do not carry Qwen4-only fields.
+
+Execution flags are registered in `env.py`: `MINISGL_QWEN4_REFERENCE`,
+`MINISGL_QWEN4_SGLANG_NUMERICS`, `MINISGL_QWEN4_PLE_STORAGE`, and
+`MINISGL_QWEN4_PLE_PREFETCH`. Unlike the older import-time env options, these are
+read and strictly validated at Qwen4 worker startup, after selecting its device.
+Boolean flags accept `0`/`1`; unset numerics selects SM100/CUDA 13+ automatically
+unless reference mode is requested. The engine retains the resolved values as
+an immutable internal `Qwen4Execution` snapshot in its execution context, shared
+by model layers, attention and weight packing. They are not model config fields
+or another user configuration API. Changing env after startup does not switch
+an existing model's storage, kernels, or captured graphs; restart the worker.
+Existing environment variable names and engine/scheduler CLI flags are unchanged.
 
 `--qwen4-state-cache-mb 1024` caps the per-rank GPU checkpoint pool separately
 from active request state. `--qwen4-checkpoint-interval 4096` controls periodic

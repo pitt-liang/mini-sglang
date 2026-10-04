@@ -9,7 +9,7 @@ import math
 
 import torch
 import torch.nn.functional as F
-from minisgl.core import get_global_ctx
+from minisgl.core import get_global_ctx, get_qwen4_execution
 from minisgl.distributed import get_tp_info
 from minisgl.kernel import qwen4_ops as ops
 from minisgl.kernel.qwen4 import (
@@ -59,6 +59,7 @@ class NarrowLinear(LinearReplicated):
 class GatedResidual(BaseOP):
     def __init__(self, config: Qwen4Config, combine: bool = True) -> None:
         self.config: Qwen4Config = config
+        self.execution = get_qwen4_execution()
         self.h, self.n = config.hidden_size, config.hc_count
         self.eps = config.rms_norm_eps
         width = self.h * self.n
@@ -85,9 +86,9 @@ class GatedResidual(BaseOP):
         )
 
     def forward(self, residual):
-        if not self.config.use_optimized_kernels(residual):
+        if not self.execution.use_optimized_kernels(residual):
             return self._forward_eager(residual)
-        if self.config.aligned:
+        if self.execution.aligned:
             normed = ops.grouped_norm(residual, self.hc_norm.weight, self.h, self.eps)
             # Cache hits change GEMM row counts. Both cuBLAS and the fused
             # small-row HC path can then choose different reduction orders.
@@ -138,9 +139,9 @@ class GatedResidual(BaseOP):
         return mixed, normed
 
     def combine(self, residual, output, injection):
-        if not self.config.use_optimized_kernels(residual):
+        if not self.execution.use_optimized_kernels(residual):
             return self._combine_eager(residual, output, injection)
-        if self.config.aligned:
+        if self.execution.aligned:
             return ops.gr_combine(residual, output, injection, self.block_inject_weight.weight)
         return ops.legacy_gr_combine(residual, output, injection, self.block_inject_weight.weight)
 
@@ -148,6 +149,7 @@ class GatedResidual(BaseOP):
 class GatedDeltaNet(BaseOP):
     def __init__(self, config: Qwen4Config, layer_id: int) -> None:
         self.config: Qwen4Config = config
+        self.execution = get_qwen4_execution()
         c, tp = config, get_tp_info().size
         h = config.hidden_size
         self.hk, self.hv = c.linear_num_key_heads // tp, c.linear_num_value_heads // tp
@@ -198,9 +200,9 @@ class GatedDeltaNet(BaseOP):
         return self.out_proj.forward(y.flatten(1))
 
     def forward(self, x):
-        if not self.config.use_optimized_kernels(x):
+        if not self.execution.use_optimized_kernels(x):
             return self._forward_eager(x)
-        if self.config.aligned:
+        if self.execution.aligned:
             return self.forward_aligned(x)
         ctx = get_global_ctx()
         qkv, z, a, b = F.linear(x, self._packed).split(self._widths, -1)
@@ -372,6 +374,7 @@ class QSAIndexer(BaseOP):
 class QSAAttention(BaseOP):
     def __init__(self, config: Qwen4Config, layer_id: int) -> None:
         self.config: Qwen4Config = config
+        self.execution = get_qwen4_execution()
         tp = get_tp_info().size
         self.layer_id = layer_id
         self.hq, self.hkv, self.dim = (
@@ -419,12 +422,12 @@ class QSAAttention(BaseOP):
         return self.o_proj.forward((out * gate.sigmoid()).flatten(1))
 
     def forward(self, x):
-        if not self.config.use_optimized_kernels(x):
+        if not self.execution.use_optimized_kernels(x):
             return self._forward_eager(x)
         ctx, rc = get_global_ctx(), self.config.rotary_config
         pos = ctx.batch.positions
         linear = _prefill_linear(ctx)
-        if self.config.aligned:
+        if self.execution.aligned:
             cut = sum(self._widths[:3])
             qg, k, v = linear(x, self._packed[:cut]).split(self._widths[:3], -1)
             iqk = linear(x, self._packed[cut:])
@@ -441,7 +444,7 @@ class QSAAttention(BaseOP):
         }
 
         def norm(t, w):
-            if self.config.aligned:
+            if self.execution.aligned:
                 return ops.norm_rope(t, w, pos, self._rope_cache, self.config.rms_norm_eps)
             return ops.legacy_norm(t, w, **kwargs)
 
@@ -450,14 +453,14 @@ class QSAAttention(BaseOP):
         ix = self.indexer
         iq, ik = iqk.split((ix.heads * ix.dim, ix.dim), -1)
         iq = iq.view(-1, ix.heads, ix.dim)
-        if self.config.aligned:
+        if self.execution.aligned:
             iq = ops.index_norm_rope(
                 iq, ix.q_layernorm.weight, pos, self._rope_cache, self.config.rms_norm_eps
             )
         else:
             iq = norm(iq, ix.q_layernorm.weight)
         out = ctx.attn_backend.qsa(q, k, v, iq, ik, ix.k_layernorm.weight, self.layer_id)
-        if self.config.aligned:
+        if self.execution.aligned:
             return _output_projection(self.o_proj, ops.sigmoid_mul(out, gate).flatten(1), linear)
         return self.o_proj.forward((out * gate.sigmoid()).flatten(1))
 
@@ -475,6 +478,7 @@ class SharedMLP(BaseOP):
 class SparseMoE(BaseOP):
     def __init__(self, config: Qwen4Config) -> None:
         self.config: Qwen4Config = config
+        self.execution = get_qwen4_execution()
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, False)
         self.experts = MoELayer(
             config.num_experts,
@@ -493,9 +497,9 @@ class SparseMoE(BaseOP):
         return routed + shared
 
     def forward(self, x):
-        if not self.config.use_optimized_kernels(x):
+        if not self.execution.use_optimized_kernels(x):
             return self._forward_eager(x)
-        if self.config.aligned:
+        if self.execution.aligned:
             from minisgl.layers import silu_and_mul
             from minisgl.moe.fused import fused_experts_impl
 
@@ -597,6 +601,7 @@ class NGramEmbedding(BaseOP):
 class PLE(BaseOP):
     def __init__(self, config: Qwen4Config, layer_id: int) -> None:
         self.config: Qwen4Config = config
+        self.execution = get_qwen4_execution()
         c = config
         self.layer_id = layer_id
         self.ple_embedding = NGramEmbedding(config, c.ple_layer_ids.index(layer_id + 1))
@@ -611,14 +616,14 @@ class PLE(BaseOP):
 
     def initialize_runtime(self, device):
         self.ple_embedding.ngram_embedding.initialize_runtime(device)
-        if self.config.ple_prefetch:
+        if self.execution.ple_prefetch:
             self._prefetch_stream = torch.cuda.Stream(device=device)
 
     def prepare_ids(self):
         """Advance token history exactly once, whether lookup is prefetched or not."""
         ctx, cfg = get_global_ctx(), self.config
         c, pe = cfg, self.ple_embedding
-        if self.config.use_optimized_kernels(ctx.batch.input_ids) and not ctx.batch.is_prefill:
+        if self.execution.use_optimized_kernels(ctx.batch.input_ids) and not ctx.batch.is_prefill:
             m = ctx.batch.attn_metadata
             return ops.hash_decode(
                 ctx.batch.input_ids,
@@ -688,7 +693,7 @@ class PLE(BaseOP):
         h, n, eps = cfg.hidden_size, c.hc_count, cfg.rms_norm_eps
 
         norm = rms_norm
-        if self.config.aligned and self.config.use_optimized_kernels(residual):
+        if self.execution.aligned and self.execution.use_optimized_kernels(residual):
             from minisgl.kernel.qwen4_ops import grouped_norm
 
             def norm(x, w, eps, h):
@@ -719,7 +724,7 @@ class PLE(BaseOP):
 
     def forward(self, residual):
         ctx = get_global_ctx()
-        if not self.config.use_optimized_kernels(residual) or ctx.batch.is_prefill:
+        if not self.execution.use_optimized_kernels(residual) or ctx.batch.is_prefill:
             return self._forward_eager(residual)
         cfg = self.config
         c, m = cfg, ctx.batch.attn_metadata
@@ -727,20 +732,20 @@ class PLE(BaseOP):
         h, n, eps = cfg.hidden_size, c.hc_count, cfg.rms_norm_eps
 
         def norm(x, w):
-            if self.config.aligned:
+            if self.execution.aligned:
                 return ops.grouped_norm(x, w, h, eps)
             return ops.legacy_norm(x, w, eps, h)
 
         key = norm(self.key_proj.forward(emb), self.norm_key.weight).view(-1, n, h)
         query = norm(residual, self.norm_query.weight).view(-1, n, h)
         gate = (key * query).sum(-1, keepdim=True) / math.sqrt(h)
-        if self.config.aligned:
+        if self.execution.aligned:
             value = ops.ple_gate_value(gate, self.value_proj.forward(emb))
         else:
             gate = gate.sign() * gate.abs().clamp_min(1e-6).sqrt()
             value = (gate.sigmoid() * self.value_proj.forward(emb)[:, None]).flatten(1)
         normed = norm(value, self.norm_conv.weight)
-        conv = ops.ple_conv_decode if self.config.aligned else ops.legacy_conv_decode
+        conv = ops.ple_conv_decode if self.execution.aligned else ops.legacy_conv_decode
         out = conv(
             normed,
             self.conv1d.weight,
@@ -787,8 +792,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         if not isinstance(config, Qwen4Config):
             raise TypeError("Qwen4 model requires Qwen4Config")
         self.config: Qwen4Config = config
-        if self.config.aligned is None:
-            raise ValueError("Resolve Qwen4Config on the target device before construction")
+        self.execution = get_qwen4_execution()
         tp = get_tp_info().size
         c = config
         for heads in (

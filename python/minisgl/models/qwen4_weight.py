@@ -61,7 +61,7 @@ def load_qwen4_weights(model: Qwen4ExpForCausalLM, model_path: str, device: torc
         key = "model.language_model." + name[len("model.") :] if name.startswith("model.") else name
         dtype = torch.float32 if attr in ("A_log", "dt_bias") else meta.dtype
         is_ple_table = ".ple_embedding.ngram_embedding.weight" in name
-        if is_ple_table and model.config.ple_storage == "pinned":
+        if is_ple_table and model.execution.ple_storage == "pinned":
             ops.validate_ple_host_device(device)
             # Load TP-owned checkpoint rows directly into host storage, never
             # allocate/stage the complete table on the GPU first.
@@ -155,9 +155,7 @@ def pack_qwen4_weights(model: Qwen4ExpForCausalLM) -> None:
     Called after checkpoint validation, before graph capture. No permanent copy
     of the original matrices is retained, and reference forward stays available.
     """
-    if model.config.aligned is None:
-        raise ValueError("Qwen4 execution policy must be resolved before packing weights")
-    if model.config.aligned and torch.cuda.get_device_capability()[0] == 10:
+    if model.execution.aligned and torch.cuda.get_device_capability()[0] == 10:
         from minisgl.kernel._qwen4_cute.hc_mix import permute_pad_up_weight
 
         groups = [model.model.hyper_connection_mixer]
@@ -167,7 +165,7 @@ def pack_qwen4_weights(model: Qwen4ExpForCausalLM) -> None:
             gr._sg_up = permute_pad_up_weight(gr.input_mix_weight_up.weight, gr.n)
     for layer in model.model.layers.op_list:
         attn = layer.linear_attn or layer.self_attn
-        if model.config.aligned and layer.self_attn is not None:
+        if model.execution.aligned and layer.self_attn is not None:
             rc = attn.config.rotary_config
             attn._rope_cache = ops.rope_cache(
                 attn.q_norm.weight.device, rc.rotary_dim, rc.base, rc.max_position
@@ -175,7 +173,7 @@ def pack_qwen4_weights(model: Qwen4ExpForCausalLM) -> None:
         projections = (
             (
                 [attn.in_proj_qkv, attn.in_proj_z, attn.in_proj_b, attn.in_proj_a]
-                if model.config.aligned
+                if model.execution.aligned
                 else [attn.in_proj_qkv, attn.in_proj_z, attn.in_proj_a, attn.in_proj_b]
             )
             if layer.linear_attn is not None

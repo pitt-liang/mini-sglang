@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import os
 from functools import partial
-from typing import Callable, Generic, TypeVar
+from typing import TYPE_CHECKING, Callable, Generic, Literal, NamedTuple, TypeVar
+
+if TYPE_CHECKING:
+    import torch
 
 
 class BaseEnv:
@@ -11,6 +14,30 @@ class BaseEnv:
 
 
 T = TypeVar("T")
+
+
+class StartupEnvVar(BaseEnv, Generic[T]):
+    """Strict opt-in read at worker startup, not module import or forward time.
+
+    Unrelated models need not validate Qwen4 flags. Unlike the legacy EnvVar,
+    invalid values are never silently replaced with defaults.
+    """
+
+    def __init__(self, default_value: T, fn: Callable[[str], T]):
+        self.default_value = default_value
+        self.fn = fn
+
+    def _init(self, name: str) -> None:
+        self.name = name
+
+    def read(self) -> T:
+        value = os.getenv(self.name)
+        if value is None:
+            return self.default_value
+        try:
+            return self.fn(value)
+        except ValueError as exc:
+            raise ValueError(f"{self.name}: {exc}") from exc
 
 
 class EnvVar(BaseEnv, Generic[T]):
@@ -55,6 +82,20 @@ EnvOption = partial(EnvVar[bool | None], fn=_TO_BOOL, default_value=None)
 EnvMem = partial(EnvVar[int], fn=_PARSE_MEM_BYTES)
 
 
+def _strict_bool(value: str) -> bool:
+    if value not in ("0", "1"):
+        raise ValueError("must be 0 or 1")
+    return value == "1"
+
+
+def _ple_storage(value: str) -> Literal["gpu", "pinned"]:
+    if value == "gpu":
+        return "gpu"
+    if value == "pinned":
+        return "pinned"
+    raise ValueError("must be gpu or pinned")
+
+
 class EnvClassSingleton:
     _instance: EnvClassSingleton | None = None
 
@@ -68,6 +109,12 @@ class EnvClassSingleton:
     FLASHINFER_USE_TENSOR_CORES = EnvOption()
     DISABLE_OVERLAP_SCHEDULING = EnvBool(False)
     PYNCCL_MAX_BUFFER_SIZE = EnvMem(1024**3)
+
+    # Qwen4 startup flags: read together after the worker selects its device.
+    QWEN4_REFERENCE = StartupEnvVar(False, _strict_bool)
+    QWEN4_SGLANG_NUMERICS = StartupEnvVar[bool | None](None, _strict_bool)
+    QWEN4_PLE_STORAGE = StartupEnvVar[Literal["gpu", "pinned"]]("gpu", _ple_storage)
+    QWEN4_PLE_PREFETCH = StartupEnvVar(False, _strict_bool)
 
     def __new__(cls):
         # single instance
@@ -85,3 +132,41 @@ class EnvClassSingleton:
 
 
 ENV = EnvClassSingleton()
+
+
+class Qwen4Execution(NamedTuple):
+    """Internal resolved worker state, not model metadata or a user config API.
+
+    The engine, weight loader and layers share this immutable snapshot. Never
+    re-read env during execution: packing and captured graphs depend on it.
+    """
+
+    reference: bool
+    aligned: bool
+    ple_storage: Literal["gpu", "pinned"]
+    ple_prefetch: bool
+
+    def use_optimized_kernels(self, x: torch.Tensor | None = None) -> bool:
+        return not self.reference and (x is None or x.is_cuda)
+
+
+def resolve_qwen4_execution(device: torch.device) -> Qwen4Execution:
+    """Called once per Qwen4 worker, before construction, packing and capture."""
+    import torch
+
+    reference = ENV.QWEN4_REFERENCE.read()
+    requested = ENV.QWEN4_SGLANG_NUMERICS.read()
+    storage = ENV.QWEN4_PLE_STORAGE.read()
+    prefetch = ENV.QWEN4_PLE_PREFETCH.read()
+    supported = (
+        device.type == "cuda"
+        and torch.cuda.get_device_capability(device)[0] == 10
+        and torch.version.cuda is not None
+        and int(torch.version.cuda.split(".")[0]) >= 13
+    )
+    if requested is True and not supported:
+        raise ValueError("Qwen4 aligned kernels currently require SM100 and CUDA 13+")
+    if device.type != "cuda" and (storage == "pinned" or prefetch):
+        raise ValueError("Qwen4 PLE offload/prefetch requires a CUDA device")
+    aligned = (supported and not reference) if requested is None else requested
+    return Qwen4Execution(reference, aligned, storage, prefetch)

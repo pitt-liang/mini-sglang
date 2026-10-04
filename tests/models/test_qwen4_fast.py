@@ -6,7 +6,7 @@ import torch
 from minisgl.kernel import qwen4_ops as fast
 from minisgl.kernel.qwen4 import gated_delta_decode, gated_delta_rule
 from minisgl.models import qwen4_ops as ref
-from qwen4_test_utils import make_qwen4_config
+from qwen4_test_utils import make_qwen4_config, qwen4_execution
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -68,9 +68,6 @@ class FastTests(unittest.TestCase):
         def run(storage, prefetch, captured):
             torch.manual_seed(73)
             cfg = make_qwen4_config(
-                aligned=True,
-                ple_storage=storage,
-                ple_prefetch=prefetch,
                 hidden_size=512,
                 rms_norm_eps=1e-6,
                 ple_layer_ids=(2,),
@@ -83,8 +80,12 @@ class FastTests(unittest.TestCase):
                 make_ngram_vocab_size_divisible_by=1,
                 eos_token_id=2,
             )
-            with patch(
-                "minisgl.layers.embedding.get_tp_info", return_value=SimpleNamespace(rank=0, size=1)
+            with (
+                patch(
+                    "minisgl.layers.embedding.get_tp_info",
+                    return_value=SimpleNamespace(rank=0, size=1),
+                ),
+                qwen4_execution(aligned=True, ple_storage=storage, ple_prefetch=prefetch),
             ):
                 ple = PLE(cfg, 1)
             for _, owner, attr, weight in _parameters(ple):
@@ -209,7 +210,6 @@ class FastTests(unittest.TestCase):
         )
         model = SimpleNamespace(
             config=make_qwen4_config(
-                ple_storage="pinned",
                 linear_num_key_heads=1,
                 linear_key_head_dim=1,
                 linear_num_value_heads=1,
@@ -234,7 +234,9 @@ class FastTests(unittest.TestCase):
                 patch("minisgl.models.qwen4_weight.download_hf_weight", return_value=directory),
                 patch("minisgl.distributed.info._TP_INFO", DistributedInfo(1, 2)),
             ):
-                load_qwen4_weights(model, directory, torch.device("cuda"))
+                with qwen4_execution(ple_storage="pinned") as execution:
+                    model.execution = execution
+                    load_qwen4_weights(model, directory, torch.device("cuda"))
             self.assertEqual(torch.cuda.memory_allocated(), before)
         self.assertEqual(table.weight.device.type, "cpu")
         self.assertTrue(table.weight.is_pinned())
@@ -261,13 +263,13 @@ class FastTests(unittest.TestCase):
         from minisgl.models.qwen4 import GatedResidual
 
         cfg = make_qwen4_config(
-            aligned=False,
             hidden_size=2560,
             hc_count=4,
             hc_lowrank=320,
             rms_norm_eps=1e-6,
         )
-        op = GatedResidual(cfg)
+        with qwen4_execution():
+            op = GatedResidual(cfg)
         for obj in [
             op.hc_norm,
             op.input_mix_weight_down,
