@@ -1,5 +1,6 @@
 from .base import BaseLLMModel
 from .config import ModelConfig, RotaryConfig
+from .qwen4_config import Qwen4Config
 from .register import get_model_class
 from .weight import load_weight
 
@@ -8,4 +9,4 @@ def create_model(model_config: ModelConfig) -> BaseLLMModel:
     return get_model_class(model_config.architectures[0], model_config)
 
 
-__all__ = ["create_model", "load_weight", "RotaryConfig"]
+__all__ = ["create_model", "load_weight", "ModelConfig", "Qwen4Config", "RotaryConfig"]

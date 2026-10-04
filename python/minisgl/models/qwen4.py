@@ -23,6 +23,7 @@ from minisgl.layers.base import OPList
 from minisgl.layers.embedding import ParallelLMHead, VocabParallelEmbedding
 
 from .base import BaseLLMModel
+from .qwen4_config import Qwen4Config
 from .qwen4_ops import causal_conv, l2_norm, ngram_ids, rms_norm, rotary
 
 
@@ -56,14 +57,14 @@ class NarrowLinear(LinearReplicated):
 
 
 class GatedResidual(BaseOP):
-    def __init__(self, config, combine=True):
-        self.runtime = config.qwen4_runtime
-        self.h, self.n = config.hidden_size, config.hybrid["hc_count"]
+    def __init__(self, config: Qwen4Config, combine: bool = True) -> None:
+        self.config: Qwen4Config = config
+        self.h, self.n = config.hidden_size, config.hc_count
         self.eps = config.rms_norm_eps
         width = self.h * self.n
         self.hc_norm = Weight(width)
-        self.input_mix_weight_down = LinearReplicated(width, config.hybrid["hc_lowrank"], False)
-        self.input_mix_weight_up = LinearReplicated(config.hybrid["hc_lowrank"], width, False)
+        self.input_mix_weight_down = LinearReplicated(width, config.hc_lowrank, False)
+        self.input_mix_weight_up = LinearReplicated(config.hc_lowrank, width, False)
         self.block_inject_weight = NarrowLinear(width, self.n, False) if combine else None
 
     def _forward_eager(self, residual):
@@ -84,9 +85,9 @@ class GatedResidual(BaseOP):
         )
 
     def forward(self, residual):
-        if not self.runtime.enabled(residual):
+        if not self.config.use_optimized_kernels(residual):
             return self._forward_eager(residual)
-        if self.runtime.aligned:
+        if self.config.aligned:
             normed = ops.grouped_norm(residual, self.hc_norm.weight, self.h, self.eps)
             # Cache hits change GEMM row counts. Both cuBLAS and the fused
             # small-row HC path can then choose different reduction orders.
@@ -137,27 +138,27 @@ class GatedResidual(BaseOP):
         return mixed, normed
 
     def combine(self, residual, output, injection):
-        if not self.runtime.enabled(residual):
+        if not self.config.use_optimized_kernels(residual):
             return self._combine_eager(residual, output, injection)
-        if self.runtime.aligned:
+        if self.config.aligned:
             return ops.gr_combine(residual, output, injection, self.block_inject_weight.weight)
         return ops.legacy_gr_combine(residual, output, injection, self.block_inject_weight.weight)
 
 
 class GatedDeltaNet(BaseOP):
-    def __init__(self, config, layer_id):
-        self.runtime = config.qwen4_runtime
-        c, tp = config.hybrid, get_tp_info().size
+    def __init__(self, config: Qwen4Config, layer_id: int) -> None:
+        self.config: Qwen4Config = config
+        c, tp = config, get_tp_info().size
         h = config.hidden_size
-        self.hk, self.hv = c["linear_num_key_heads"] // tp, c["linear_num_value_heads"] // tp
-        self.dk, self.dv = c["linear_key_head_dim"], c["linear_value_head_dim"]
+        self.hk, self.hv = c.linear_num_key_heads // tp, c.linear_num_value_heads // tp
+        self.dk, self.dv = c.linear_key_head_dim, c.linear_value_head_dim
         self.layer_id, self.eps = layer_id, config.rms_norm_eps
-        kd, vd = c["linear_num_key_heads"] * self.dk, c["linear_num_value_heads"] * self.dv
+        kd, vd = c.linear_num_key_heads * self.dk, c.linear_num_value_heads * self.dv
         self.in_proj_qkv = LinearColParallelMerged(h, [kd, kd, vd], False)
         self.in_proj_z = LinearColParallelMerged(h, [vd], False)
-        self.in_proj_a = LinearColParallelMerged(h, [c["linear_num_value_heads"]], False)
-        self.in_proj_b = LinearColParallelMerged(h, [c["linear_num_value_heads"]], False)
-        self.conv1d = Weight((2 * kd + vd) // tp, 1, c["linear_conv_kernel_dim"])
+        self.in_proj_a = LinearColParallelMerged(h, [c.linear_num_value_heads], False)
+        self.in_proj_b = LinearColParallelMerged(h, [c.linear_num_value_heads], False)
+        self.conv1d = Weight((2 * kd + vd) // tp, 1, c.linear_conv_kernel_dim)
         self.A_log = torch.empty(self.hv)
         self.dt_bias = torch.empty(self.hv)
         self.norm = Weight(self.dv)
@@ -197,9 +198,9 @@ class GatedDeltaNet(BaseOP):
         return self.out_proj.forward(y.flatten(1))
 
     def forward(self, x):
-        if not self.runtime.enabled(x):
+        if not self.config.use_optimized_kernels(x):
             return self._forward_eager(x)
-        if self.runtime.aligned:
+        if self.config.aligned:
             return self.forward_aligned(x)
         ctx = get_global_ctx()
         qkv, z, a, b = F.linear(x, self._packed).split(self._widths, -1)
@@ -359,9 +360,9 @@ class GatedDeltaNet(BaseOP):
 
 
 class QSAIndexer(BaseOP):
-    def __init__(self, config):
-        c = config.hybrid
-        self.heads, self.dim = c["indexer_n_heads"], c["indexer_head_dim"]
+    def __init__(self, config: Qwen4Config) -> None:
+        c = config
+        self.heads, self.dim = c.indexer_n_heads, c.indexer_head_dim
         self.index_qk_proj = LinearReplicated(
             config.hidden_size, (self.heads + 1) * self.dim, False
         )
@@ -369,10 +370,10 @@ class QSAIndexer(BaseOP):
 
 
 class QSAAttention(BaseOP):
-    def __init__(self, config, layer_id):
-        self.runtime = config.qwen4_runtime
+    def __init__(self, config: Qwen4Config, layer_id: int) -> None:
+        self.config: Qwen4Config = config
         tp = get_tp_info().size
-        self.config, self.layer_id = config, layer_id
+        self.layer_id = layer_id
         self.hq, self.hkv, self.dim = (
             config.num_qo_heads // tp,
             config.num_kv_heads // tp,
@@ -418,12 +419,12 @@ class QSAAttention(BaseOP):
         return self.o_proj.forward((out * gate.sigmoid()).flatten(1))
 
     def forward(self, x):
-        if not self.runtime.enabled(x):
+        if not self.config.use_optimized_kernels(x):
             return self._forward_eager(x)
         ctx, rc = get_global_ctx(), self.config.rotary_config
         pos = ctx.batch.positions
         linear = _prefill_linear(ctx)
-        if self.runtime.aligned:
+        if self.config.aligned:
             cut = sum(self._widths[:3])
             qg, k, v = linear(x, self._packed[:cut]).split(self._widths[:3], -1)
             iqk = linear(x, self._packed[cut:])
@@ -440,7 +441,7 @@ class QSAAttention(BaseOP):
         }
 
         def norm(t, w):
-            if self.runtime.aligned:
+            if self.config.aligned:
                 return ops.norm_rope(t, w, pos, self._rope_cache, self.config.rms_norm_eps)
             return ops.legacy_norm(t, w, **kwargs)
 
@@ -449,14 +450,14 @@ class QSAAttention(BaseOP):
         ix = self.indexer
         iq, ik = iqk.split((ix.heads * ix.dim, ix.dim), -1)
         iq = iq.view(-1, ix.heads, ix.dim)
-        if self.runtime.aligned:
+        if self.config.aligned:
             iq = ops.index_norm_rope(
                 iq, ix.q_layernorm.weight, pos, self._rope_cache, self.config.rms_norm_eps
             )
         else:
             iq = norm(iq, ix.q_layernorm.weight)
         out = ctx.attn_backend.qsa(q, k, v, iq, ik, ix.k_layernorm.weight, self.layer_id)
-        if self.runtime.aligned:
+        if self.config.aligned:
             return _output_projection(self.o_proj, ops.sigmoid_mul(out, gate).flatten(1), linear)
         return self.o_proj.forward((out * gate.sigmoid()).flatten(1))
 
@@ -472,8 +473,8 @@ class SharedMLP(BaseOP):
 
 
 class SparseMoE(BaseOP):
-    def __init__(self, config):
-        self.runtime = config.qwen4_runtime
+    def __init__(self, config: Qwen4Config) -> None:
+        self.config: Qwen4Config = config
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, False)
         self.experts = MoELayer(
             config.num_experts,
@@ -482,9 +483,7 @@ class SparseMoE(BaseOP):
             config.moe_intermediate_size,
             config.norm_topk_prob,
         )
-        self.shared_expert = SharedMLP(
-            config.hidden_size, config.hybrid["shared_expert_intermediate_size"]
-        )
+        self.shared_expert = SharedMLP(config.hidden_size, config.shared_expert_intermediate_size)
         self.shared_expert_gate = NarrowLinear(config.hidden_size, 1, False)
 
     def _forward_eager(self, x):
@@ -494,9 +493,9 @@ class SparseMoE(BaseOP):
         return routed + shared
 
     def forward(self, x):
-        if not self.runtime.enabled(x):
+        if not self.config.use_optimized_kernels(x):
             return self._forward_eager(x)
-        if self.runtime.aligned:
+        if self.config.aligned:
             from minisgl.layers import silu_and_mul
             from minisgl.moe.fused import fused_experts_impl
 
@@ -576,50 +575,50 @@ class NGramTable(VocabParallelEmbedding):
 
 
 class NGramEmbedding(BaseOP):
-    def __init__(self, config, ple_index):
+    def __init__(self, config: Qwen4Config, ple_index: int) -> None:
         from sympy import nextprime
 
-        c = config.hybrid
-        self.heads, self.n = c["heads_per_ngram"], c["ngram_size"]
+        c = config
+        self.heads, self.n = c.heads_per_ngram, c.ngram_size
         total_heads = self.heads * (self.n - 1)
-        prime, total = c["ngram_vocab_size_base"] - 1, 0
+        prime, total = c.ngram_vocab_size_base - 1, 0
         for i in range((ple_index + 1) * total_heads):
             prime = int(nextprime(prime))
             if i >= ple_index * total_heads:
                 total += prime
-        divisor = c["make_ngram_vocab_size_divisible_by"]
+        divisor = c.make_ngram_vocab_size_divisible_by
         padded = math.ceil(total / divisor) * divisor
         self.layer_multipliers = torch.empty(self.n, dtype=torch.int64)
         self.ngram_heads_offsets = torch.empty(total_heads, dtype=torch.int64)
         self.ngram_heads_vocab_sizes = torch.empty(total_heads, dtype=torch.int64)
-        self.ngram_embedding = NGramTable(padded, c["ple_embed_dim"] // total_heads)
+        self.ngram_embedding = NGramTable(padded, c.ple_embed_dim // total_heads)
 
 
 class PLE(BaseOP):
-    def __init__(self, config, layer_id):
-        self.runtime = config.qwen4_runtime
-        c = config.hybrid
-        self.layer_id, self.config = layer_id, config
-        self.ple_embedding = NGramEmbedding(config, c["ple_layer_ids"].index(layer_id + 1))
-        width = c["hc_count"] * config.hidden_size
-        self.key_proj = LinearReplicated(c["ple_embed_dim"], width, False)
-        self.value_proj = LinearReplicated(c["ple_embed_dim"], config.hidden_size, False)
+    def __init__(self, config: Qwen4Config, layer_id: int) -> None:
+        self.config: Qwen4Config = config
+        c = config
+        self.layer_id = layer_id
+        self.ple_embedding = NGramEmbedding(config, c.ple_layer_ids.index(layer_id + 1))
+        width = c.hc_count * config.hidden_size
+        self.key_proj = LinearReplicated(c.ple_embed_dim, width, False)
+        self.value_proj = LinearReplicated(c.ple_embed_dim, config.hidden_size, False)
         self.norm_key, self.norm_query, self.norm_conv = Weight(width), Weight(width), Weight(width)
-        self.conv1d = Weight(width, 1, c["ple_conv_kernel_size"])
+        self.conv1d = Weight(width, 1, c.ple_conv_kernel_size)
         self._prefetch_stream = None
         self._prefetch_buffers = {}
         self._prefetch_state = None
 
     def initialize_runtime(self, device):
         self.ple_embedding.ngram_embedding.initialize_runtime(device)
-        if self.runtime.ple_prefetch:
+        if self.config.ple_prefetch:
             self._prefetch_stream = torch.cuda.Stream(device=device)
 
     def prepare_ids(self):
         """Advance token history exactly once, whether lookup is prefetched or not."""
         ctx, cfg = get_global_ctx(), self.config
-        c, pe = cfg.hybrid, self.ple_embedding
-        if self.runtime.enabled(ctx.batch.input_ids) and not ctx.batch.is_prefill:
+        c, pe = cfg, self.ple_embedding
+        if self.config.use_optimized_kernels(ctx.batch.input_ids) and not ctx.batch.is_prefill:
             m = ctx.batch.attn_metadata
             return ops.hash_decode(
                 ctx.batch.input_ids,
@@ -628,7 +627,7 @@ class PLE(BaseOP):
                 pe.ngram_heads_vocab_sizes,
                 pe.ngram_heads_offsets,
                 pe.heads,
-                c["eos_token_id"],
+                c.eos_token_id,
                 m.slots,
                 m.valid,
             ).flatten()
@@ -642,7 +641,7 @@ class PLE(BaseOP):
                     pe.ngram_heads_vocab_sizes,
                     pe.ngram_heads_offsets,
                     pe.heads,
-                    c["eos_token_id"],
+                    c.eos_token_id,
                 )
             )
         return torch.cat(ids).flatten()
@@ -684,12 +683,12 @@ class PLE(BaseOP):
 
     def _forward_eager(self, residual):
         ctx, cfg = get_global_ctx(), self.config
-        c = cfg.hybrid
+        c = cfg
         embeddings = self.consume_embeddings().view(residual.shape[0], -1)
-        h, n, eps = cfg.hidden_size, c["hc_count"], cfg.rms_norm_eps
+        h, n, eps = cfg.hidden_size, c.hc_count, cfg.rms_norm_eps
 
         norm = rms_norm
-        if self.runtime.aligned and self.runtime.enabled(residual):
+        if self.config.aligned and self.config.use_optimized_kernels(residual):
             from minisgl.kernel.qwen4_ops import grouped_norm
 
             def norm(x, w, eps, h):
@@ -714,57 +713,57 @@ class PLE(BaseOP):
                 normed[a:b],
                 self.conv1d.weight,
                 ctx.kv_cache.ple_conv[self.layer_id][slot],
-                c["ngram_size"],
+                c.ngram_size,
             )
         return value + out
 
     def forward(self, residual):
         ctx = get_global_ctx()
-        if not self.runtime.enabled(residual) or ctx.batch.is_prefill:
+        if not self.config.use_optimized_kernels(residual) or ctx.batch.is_prefill:
             return self._forward_eager(residual)
         cfg = self.config
-        c, m = cfg.hybrid, ctx.batch.attn_metadata
+        c, m = cfg, ctx.batch.attn_metadata
         emb = self.consume_embeddings().view(residual.shape[0], -1)
-        h, n, eps = cfg.hidden_size, c["hc_count"], cfg.rms_norm_eps
+        h, n, eps = cfg.hidden_size, c.hc_count, cfg.rms_norm_eps
 
         def norm(x, w):
-            if self.runtime.aligned:
+            if self.config.aligned:
                 return ops.grouped_norm(x, w, h, eps)
             return ops.legacy_norm(x, w, eps, h)
 
         key = norm(self.key_proj.forward(emb), self.norm_key.weight).view(-1, n, h)
         query = norm(residual, self.norm_query.weight).view(-1, n, h)
         gate = (key * query).sum(-1, keepdim=True) / math.sqrt(h)
-        if self.runtime.aligned:
+        if self.config.aligned:
             value = ops.ple_gate_value(gate, self.value_proj.forward(emb))
         else:
             gate = gate.sign() * gate.abs().clamp_min(1e-6).sqrt()
             value = (gate.sigmoid() * self.value_proj.forward(emb)[:, None]).flatten(1)
         normed = norm(value, self.norm_conv.weight)
-        conv = ops.ple_conv_decode if self.runtime.aligned else ops.legacy_conv_decode
+        conv = ops.ple_conv_decode if self.config.aligned else ops.legacy_conv_decode
         out = conv(
             normed,
             self.conv1d.weight,
             ctx.kv_cache.ple_conv[self.layer_id],
             m.slots,
             m.valid,
-            c["ngram_size"],
+            c.ngram_size,
         )
         return value + out
 
 
 class DecoderLayer(BaseOP):
-    def __init__(self, config, layer_id):
+    def __init__(self, config: Qwen4Config, layer_id: int) -> None:
         self.attn_hyper_connection = GatedResidual(config)
         self.mlp_hyper_connection = GatedResidual(config)
         self.linear_attn = (
             GatedDeltaNet(config, layer_id)
-            if config.hybrid["layer_types"][layer_id] == "linear_attention"
+            if config.layer_types[layer_id] == "linear_attention"
             else None
         )
         self.self_attn = QSAAttention(config, layer_id) if self.linear_attn is None else None
         self.mlp = SparseMoE(config)
-        self.ple = PLE(config, layer_id) if layer_id + 1 in config.hybrid["ple_layer_ids"] else None
+        self.ple = PLE(config, layer_id) if layer_id + 1 in config.ple_layer_ids else None
 
     def forward(self, residual):
         if self.ple is not None:
@@ -777,36 +776,37 @@ class DecoderLayer(BaseOP):
 
 
 class Qwen4Text(BaseOP):
-    def __init__(self, config):
+    def __init__(self, config: Qwen4Config) -> None:
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = OPList([DecoderLayer(config, i) for i in range(config.num_layers)])
         self.hyper_connection_mixer = GatedResidual(config, combine=False)
 
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
-    def __init__(self, config):
-        self.runtime = config.qwen4_runtime
-        if self.runtime.aligned is None:
-            raise ValueError("Resolve Qwen4RuntimeConfig on the target device before construction")
+    def __init__(self, config: Qwen4Config) -> None:
+        if not isinstance(config, Qwen4Config):
+            raise TypeError("Qwen4 model requires Qwen4Config")
+        self.config: Qwen4Config = config
+        if self.config.aligned is None:
+            raise ValueError("Resolve Qwen4Config on the target device before construction")
         tp = get_tp_info().size
-        c = config.hybrid
+        c = config
         for heads in (
             config.num_qo_heads,
             config.num_kv_heads,
-            c["linear_num_key_heads"],
-            c["linear_num_value_heads"],
+            c.linear_num_key_heads,
+            c.linear_num_value_heads,
         ):
             if heads % tp:
                 raise ValueError(
                     "Qwen4 baseline requires TP to divide all head counts (checkpoint: TP=1/2)"
                 )
-        if c["indexer_kv_heads"] != 1 or c["output_gate_type"] != "sigmoid":
+        if c.indexer_kv_heads != 1 or c.output_gate_type != "sigmoid":
             raise ValueError("Unsupported Qwen4 indexer/gate configuration")
-        self.config = config
         self.model = Qwen4Text(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
 
-    def load_weights(self, model_path, device):
+    def load_weights(self, model_path: str, device: torch.device) -> None:
         from .qwen4_weight import load_qwen4_weights, pack_qwen4_weights
 
         load_qwen4_weights(self, model_path, device)
@@ -831,7 +831,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                         history[row].fill_(ctx.kv_cache.eos)
                         history[row, width - len(tokens) :].copy_(tokens, non_blocking=True)
         residual = self.model.embed_tokens.forward(ctx.batch.input_ids).repeat(
-            1, self.config.hybrid["hc_count"]
+            1, self.config.hc_count
         )
         layers = self.model.layers.op_list
         if layers and layers[0].ple is not None:

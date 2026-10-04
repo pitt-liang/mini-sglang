@@ -13,6 +13,7 @@ from minisgl.message import (
     ExitMsg,
     UserMsg,
 )
+from minisgl.models import Qwen4Config
 from minisgl.utils import init_logger, load_tokenizer
 
 from .cache import CacheManager
@@ -72,8 +73,9 @@ class Scheduler(SchedulerIOMixin):
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
         self.eos_token_ids = {self.eos_token_id}
-        if config.model_config.is_qwen4:
-            eos = config.model_config.hybrid["eos_token_id"]
+        model_config = config.model_config
+        if isinstance(model_config, Qwen4Config):
+            eos = model_config.eos_token_id
             self.eos_token_ids.update(eos if isinstance(eos, list) else [eos])
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens

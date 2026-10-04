@@ -169,7 +169,10 @@ def main():
                 "controlled_topk": True,
                 "steps": args.steps,
                 "rank": rank,
-                "runtime": asdict(engine.model.runtime),
+                "runtime": {
+                    key: getattr(engine.model.config, key)
+                    for key in ("reference", "aligned", "ple_storage", "ple_prefetch")
+                },
                 "ple_tables": [
                     {
                         "layer": layer.ple.layer_id,

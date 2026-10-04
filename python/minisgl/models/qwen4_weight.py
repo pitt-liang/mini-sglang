@@ -1,7 +1,10 @@
 """Strict safetensors -> local TP shard streaming loader, including sharded PLE."""
 
+from __future__ import annotations
+
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 from minisgl.distributed import get_tp_info
@@ -12,6 +15,9 @@ from minisgl.layers.linear import LinearColParallelMerged, LinearOProj
 from minisgl.utils import init_logger
 from minisgl.utils.hf import download_hf_weight
 from safetensors import safe_open
+
+if TYPE_CHECKING:
+    from .qwen4 import Qwen4ExpForCausalLM
 
 logger = init_logger(__name__)
 
@@ -31,15 +37,15 @@ def _parameters(op, prefix=""):
             yield from _parameters(value, name)
 
 
-def load_qwen4_weights(model, model_path, device):
+def load_qwen4_weights(model: Qwen4ExpForCausalLM, model_path: str, device: torch.device) -> None:
     path = Path(download_hf_weight(model_path))
     with (path / "model.safetensors.index.json").open() as f:
         index = json.load(f)["weight_map"]
     used = set()
     rank, tp = get_tp_info().rank, get_tp_info().size
-    c = model.config.hybrid
-    kd = c["linear_num_key_heads"] * c["linear_key_head_dim"]
-    vd = c["linear_num_value_heads"] * c["linear_value_head_dim"]
+    c = model.config
+    kd = c.linear_num_key_heads * c.linear_key_head_dim
+    vd = c.linear_num_value_heads * c.linear_value_head_dim
 
     def copy_slice(key, dst, source_slices):
         if key not in index:
@@ -55,7 +61,7 @@ def load_qwen4_weights(model, model_path, device):
         key = "model.language_model." + name[len("model.") :] if name.startswith("model.") else name
         dtype = torch.float32 if attr in ("A_log", "dt_bias") else meta.dtype
         is_ple_table = ".ple_embedding.ngram_embedding.weight" in name
-        if is_ple_table and model.runtime.ple_storage == "pinned":
+        if is_ple_table and model.config.ple_storage == "pinned":
             ops.validate_ple_host_device(device)
             # Load TP-owned checkpoint rows directly into host storage, never
             # allocate/stage the complete table on the GPU first.
@@ -68,9 +74,9 @@ def load_qwen4_weights(model, model_path, device):
                 (k for k in index if k.startswith(prefix + "shard_")),
                 key=lambda k: int(k.split("shard_")[-1].split(".")[0]),
             )
-            if len(shard_keys) != c["split_ngram_parts"]:
+            if len(shard_keys) != c.split_ngram_parts:
                 raise ValueError(
-                    f"Expected {c['split_ngram_parts']} PLE shards, got {len(shard_keys)}"
+                    f"Expected {c.split_ngram_parts} PLE shards, got {len(shard_keys)}"
                 )
             lo, count = owner.vocab_range
             hi, offset = lo + count, 0
@@ -143,15 +149,15 @@ def load_qwen4_weights(model, model_path, device):
     )
 
 
-def pack_qwen4_weights(model):
+def pack_qwen4_weights(model: Qwen4ExpForCausalLM) -> None:
     """One allocation per merged projection; original parameter names stay views.
 
     Called after checkpoint validation, before graph capture. No permanent copy
     of the original matrices is retained, and reference forward stays available.
     """
-    if model.runtime.aligned is None:
+    if model.config.aligned is None:
         raise ValueError("Qwen4 execution policy must be resolved before packing weights")
-    if model.runtime.aligned and torch.cuda.get_device_capability()[0] == 10:
+    if model.config.aligned and torch.cuda.get_device_capability()[0] == 10:
         from minisgl.kernel._qwen4_cute.hc_mix import permute_pad_up_weight
 
         groups = [model.model.hyper_connection_mixer]
@@ -161,7 +167,7 @@ def pack_qwen4_weights(model):
             gr._sg_up = permute_pad_up_weight(gr.input_mix_weight_up.weight, gr.n)
     for layer in model.model.layers.op_list:
         attn = layer.linear_attn or layer.self_attn
-        if model.runtime.aligned and layer.self_attn is not None:
+        if model.config.aligned and layer.self_attn is not None:
             rc = attn.config.rotary_config
             attn._rope_cache = ops.rope_cache(
                 attn.q_norm.weight.device, rc.rotary_dim, rc.base, rc.max_position
@@ -169,7 +175,7 @@ def pack_qwen4_weights(model):
         projections = (
             (
                 [attn.in_proj_qkv, attn.in_proj_z, attn.in_proj_b, attn.in_proj_a]
-                if model.runtime.aligned
+                if model.config.aligned
                 else [attn.in_proj_qkv, attn.in_proj_z, attn.in_proj_a, attn.in_proj_b]
             )
             if layer.linear_attn is not None

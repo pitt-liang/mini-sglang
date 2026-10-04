@@ -21,8 +21,12 @@ SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
 
 @SUPPORTED_ATTENTION_BACKENDS.register("qwen4")
 def create_qwen4_backend(config: ModelConfig):
+    from minisgl.models import Qwen4Config
+
     from .qwen4 import Qwen4Backend
 
+    if not isinstance(config, Qwen4Config):
+        raise TypeError("Qwen4 attention requires Qwen4Config")
     return Qwen4Backend(config)
 
 

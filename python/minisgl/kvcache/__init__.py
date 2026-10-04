@@ -32,7 +32,9 @@ def create_kvcache_pool(
     device: torch.device,
     max_running_req: int = 256,
 ) -> BaseKVCachePool:
-    if model_config.is_qwen4:
+    from minisgl.models import Qwen4Config
+
+    if isinstance(model_config, Qwen4Config):
         from .qwen4_pool import Qwen4KVCache
 
         return Qwen4KVCache(model_config, num_pages, page_size, dtype, device, max_running_req + 1)

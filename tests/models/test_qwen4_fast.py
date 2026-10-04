@@ -6,7 +6,7 @@ import torch
 from minisgl.kernel import qwen4_ops as fast
 from minisgl.kernel.qwen4 import gated_delta_decode, gated_delta_rule
 from minisgl.models import qwen4_ops as ref
-from minisgl.models.config import Qwen4RuntimeConfig
+from qwen4_test_utils import make_qwen4_config
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -67,23 +67,21 @@ class FastTests(unittest.TestCase):
 
         def run(storage, prefetch, captured):
             torch.manual_seed(73)
-            cfg = SimpleNamespace(
-                qwen4_runtime=Qwen4RuntimeConfig(
-                    aligned=True, ple_storage=storage, ple_prefetch=prefetch
-                ),
+            cfg = make_qwen4_config(
+                aligned=True,
+                ple_storage=storage,
+                ple_prefetch=prefetch,
                 hidden_size=512,
                 rms_norm_eps=1e-6,
-                hybrid={
-                    "ple_layer_ids": [2],
-                    "hc_count": 4,
-                    "ple_embed_dim": 640,
-                    "ple_conv_kernel_size": 4,
-                    "heads_per_ngram": 2,
-                    "ngram_size": 3,
-                    "ngram_vocab_size_base": 97,
-                    "make_ngram_vocab_size_divisible_by": 1,
-                    "eos_token_id": 2,
-                },
+                ple_layer_ids=(2,),
+                hc_count=4,
+                ple_embed_dim=640,
+                ple_conv_kernel_size=4,
+                heads_per_ngram=2,
+                ngram_size=3,
+                ngram_vocab_size_base=97,
+                make_ngram_vocab_size_divisible_by=1,
+                eos_token_id=2,
             )
             with patch(
                 "minisgl.layers.embedding.get_tp_info", return_value=SimpleNamespace(rank=0, size=1)
@@ -210,15 +208,13 @@ class FastTests(unittest.TestCase):
             num_embeddings=7,
         )
         model = SimpleNamespace(
-            runtime=Qwen4RuntimeConfig(ple_storage="pinned"),
-            config=SimpleNamespace(
-                hybrid={
-                    "linear_num_key_heads": 1,
-                    "linear_key_head_dim": 1,
-                    "linear_num_value_heads": 1,
-                    "linear_value_head_dim": 1,
-                    "split_ngram_parts": 2,
-                }
+            config=make_qwen4_config(
+                ple_storage="pinned",
+                linear_num_key_heads=1,
+                linear_key_head_dim=1,
+                linear_num_value_heads=1,
+                linear_value_head_dim=1,
+                split_ngram_parts=2,
             ),
         )
         parameter = (
@@ -262,14 +258,13 @@ class FastTests(unittest.TestCase):
         )
 
     def test_gr(self):
-        from types import SimpleNamespace
-
         from minisgl.models.qwen4 import GatedResidual
 
-        cfg = SimpleNamespace(
-            qwen4_runtime=Qwen4RuntimeConfig(aligned=False),
+        cfg = make_qwen4_config(
+            aligned=False,
             hidden_size=2560,
-            hybrid={"hc_count": 4, "hc_lowrank": 320},
+            hc_count=4,
+            hc_lowrank=320,
             rms_norm_eps=1e-6,
         )
         op = GatedResidual(cfg)

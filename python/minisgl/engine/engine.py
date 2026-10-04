@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import replace
 from datetime import timedelta
 from typing import Any, Dict, NamedTuple, Tuple
 
@@ -12,7 +11,7 @@ from minisgl.core import Batch, Context, Req, set_global_ctx
 from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from minisgl.kvcache import create_kvcache_pool
 from minisgl.layers import set_rope_device
-from minisgl.models import create_model, load_weight
+from minisgl.models import Qwen4Config, create_model, load_weight
 from minisgl.moe import create_moe_backend
 from minisgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
 
@@ -37,15 +36,12 @@ class Engine:
 
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
         torch.cuda.set_device(self.device)
-        if config.model_config.is_qwen4:
-            model_config = config.model_config
+        model_config = config.model_config
+        if isinstance(model_config, Qwen4Config):
             object.__setattr__(
                 config,
                 "model_config",
-                replace(
-                    model_config,
-                    qwen4_runtime=model_config.qwen4_runtime.resolve(self.device),
-                ),
+                model_config.resolve_runtime(self.device),
             )
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
@@ -94,8 +90,11 @@ class Engine:
             from minisgl.kvcache.qwen4_pool import Qwen4StatePool
 
             self.kv_cache.prefix_states = Qwen4StatePool(self.kv_cache, self.state_cache_slots)
-            runtime = config.model_config.qwen4_runtime
-            self.kv_cache.internal_checkpoints = runtime.aligned and runtime.enabled()
+            model_config = config.model_config
+            assert isinstance(model_config, Qwen4Config)
+            self.kv_cache.internal_checkpoints = (
+                model_config.aligned and model_config.use_optimized_kernels()
+            )
             if self.kv_cache.internal_checkpoints:
                 self.kv_cache.track_states = Qwen4StatePool(self.kv_cache, config.max_running_req)
             self.kv_cache.checkpoint_alignment = math.lcm(config.page_size, 64)
@@ -199,36 +198,36 @@ class Engine:
             * config.model_config.num_kv_layers
         )
         state_bytes = 0
-        if config.model_config.is_qwen4:
+        model_config = config.model_config
+        if isinstance(model_config, Qwen4Config):
             from minisgl.kvcache.qwen4_pool import recurrent_bytes
 
-            c = config.model_config.hybrid
+            c = model_config
             cache_per_page += (
                 config.model_config.num_kv_layers
-                * c["indexer_head_dim"]
+                * c.indexer_head_dim
                 * self.dtype.itemsize
                 * config.page_size
-                // c["indexer_compress_ratio"]
+                // c.indexer_compress_ratio
             )
             state_bytes = recurrent_bytes(
-                config.model_config, config.max_running_req + 1, config.tp_info.size, self.dtype
+                model_config, config.max_running_req + 1, config.tp_info.size, self.dtype
             )
             if getattr(config, "cache_type", None) == "hybrid":
                 # recurrent_bytes includes the tiny QSA pending ring; excluding
                 # it yields the exact immutable snapshot size.
-                per_state = recurrent_bytes(config.model_config, 1, config.tp_info.size, self.dtype)
+                per_state = recurrent_bytes(model_config, 1, config.tp_info.size, self.dtype)
                 per_state -= (
                     config.model_config.num_kv_layers
-                    * (c["indexer_compress_ratio"] - 1)
-                    * c["indexer_head_dim"]
+                    * (c.indexer_compress_ratio - 1)
+                    * c.indexer_head_dim
                     * self.dtype.itemsize
                 )
                 self.state_cache_slots = config.qwen4_state_cache_mb * 1024**2 // per_state
                 if self.state_cache_slots < 1:
                     raise ValueError("Qwen4 state cache budget must fit at least one checkpoint")
                 state_bytes += self.state_cache_slots * per_state
-                runtime = config.model_config.qwen4_runtime
-                if runtime.aligned and runtime.enabled():
+                if model_config.aligned and model_config.use_optimized_kernels():
                     state_bytes += config.max_running_req * per_state
         num_pages = config.num_page_override
         if num_pages is None:
@@ -302,12 +301,11 @@ def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
 
-    if config.model_config.is_qwen4:
-        runtime = config.model_config.qwen4_runtime
-
+    model_config = config.model_config
+    if isinstance(model_config, Qwen4Config):
         if config.attention_backend not in ("auto", "qwen4"):
             raise ValueError("Qwen4 requires the qwen4 hybrid attention backend")
-        if not runtime.enabled() and (
+        if not model_config.use_optimized_kernels() and (
             config.cuda_graph_max_bs not in (None, 0) or config.cuda_graph_bs
         ):
             raise ValueError("Qwen4 eager baseline does not support CUDA graphs")
@@ -315,9 +313,9 @@ def _adjust_config(config: EngineConfig):
             raise ValueError("Qwen4 currently supports BF16 weights only")
         override("attention_backend", "qwen4")
         if config.cuda_graph_max_bs is None and not config.cuda_graph_bs:
-            override("cuda_graph_max_bs", 4 if runtime.enabled() else 0)
+            override("cuda_graph_max_bs", 4 if model_config.use_optimized_kernels() else 0)
         if config.page_size == 1:
-            override("page_size", config.model_config.hybrid["indexer_compress_ratio"])
+            override("page_size", model_config.indexer_compress_ratio)
         if hasattr(config, "cache_type"):
             if config.cache_type == "radix":
                 override("cache_type", "hybrid")

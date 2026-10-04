@@ -1,66 +1,9 @@
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
 from typing import Any, Dict
 
 from transformers import PretrainedConfig
-
-
-@dataclass(frozen=True)
-class Qwen4RuntimeConfig:
-    """Per-model execution policy, resolved once before construction/weight packing.
-
-    Reading environment variables does not initialize CUDA. Resolving the auto
-    policy happens in the engine worker, after selecting its device. Keeping this
-    immutable prevents a different model's configuration from changing packing
-    order, attention kernels or a captured CUDA graph.
-    """
-
-    reference: bool = False
-    aligned: bool | None = None
-    ple_storage: str = "gpu"
-    ple_prefetch: bool = False
-
-    def __post_init__(self):
-        if self.ple_storage not in ("gpu", "pinned"):
-            raise ValueError("Qwen4 PLE storage must be gpu or pinned")
-
-    @classmethod
-    def from_env(cls):
-        requested = os.environ.get("MINISGL_QWEN4_SGLANG_NUMERICS")
-        if requested not in (None, "0", "1"):
-            raise ValueError("MINISGL_QWEN4_SGLANG_NUMERICS must be 0 or 1")
-        prefetch = os.environ.get("MINISGL_QWEN4_PLE_PREFETCH", "0")
-        if prefetch not in ("0", "1"):
-            raise ValueError("MINISGL_QWEN4_PLE_PREFETCH must be 0 or 1")
-        return cls(
-            reference=os.environ.get("MINISGL_QWEN4_REFERENCE", "0") == "1",
-            aligned=None if requested is None else requested == "1",
-            ple_storage=os.environ.get("MINISGL_QWEN4_PLE_STORAGE", "gpu"),
-            ple_prefetch=prefetch == "1",
-        )
-
-    def resolve(self, device):
-        import torch
-
-        supported = (
-            device.type == "cuda"
-            and torch.cuda.get_device_capability(device)[0] == 10
-            and torch.version.cuda is not None
-            and int(torch.version.cuda.split(".")[0]) >= 13
-        )
-        if self.aligned is True and not supported:
-            raise ValueError("Qwen4 aligned kernels currently require SM100 and CUDA 13+")
-        if device.type != "cuda" and (self.ple_storage == "pinned" or self.ple_prefetch):
-            raise ValueError("Qwen4 PLE offload/prefetch requires a CUDA device")
-        return replace(
-            self,
-            aligned=(supported and not self.reference) if self.aligned is None else self.aligned,
-        )
-
-    def enabled(self, x=None):
-        return not self.reference and (x is None or x.is_cuda)
 
 
 @dataclass(frozen=True)
@@ -91,18 +34,14 @@ class ModelConfig:
     norm_topk_prob: bool
     model_type: str
     architectures: list[str]
-    hybrid: Dict[str, Any] = field(default_factory=dict)
-    qwen4_runtime: Qwen4RuntimeConfig = field(default_factory=Qwen4RuntimeConfig)
 
     @property
     def is_qwen4(self) -> bool:
-        return self.model_type in ("qwen4_exp", "qwen4_exp_text")
+        return False
 
     @property
     def num_kv_layers(self) -> int:
-        return (
-            self.hybrid["layer_types"].count("full_attention") if self.is_qwen4 else self.num_layers
-        )
+        return self.num_layers
 
     @property
     def is_moe(self) -> bool:
@@ -146,39 +85,33 @@ class ModelConfig:
                 "partial_rotary_factor", getattr(config, "partial_rotary_factor", 1.0)
             )
         )
-        hybrid = dict(vars(config)) if is_qwen4 else {}
-        if is_qwen4:
-            if len(hybrid.get("layer_types", [])) != config.num_hidden_layers:
-                raise ValueError("Qwen4 requires one layer_types entry per decoder layer")
-            if set(hybrid["layer_types"]) - {"linear_attention", "full_attention"}:
-                raise ValueError("Unsupported Qwen4 layer type")
-            if rope_parameters.get("rope_type", "default") != "default":
-                raise ValueError("Qwen4 currently supports default text RoPE only")
-
-        return cls(
-            num_layers=config.num_hidden_layers,
-            num_qo_heads=config.num_attention_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            hidden_size=config.hidden_size,
-            vocab_size=config.vocab_size,
-            intermediate_size=getattr(config, "intermediate_size", moe_intermediate_size),
-            hidden_act=config.hidden_act,
-            rms_norm_eps=config.rms_norm_eps,
-            tie_word_embeddings=tie_word_embeddings,
-            rotary_config=RotaryConfig(
+        common = {
+            "num_layers": config.num_hidden_layers,
+            "num_qo_heads": config.num_attention_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_dim": head_dim,
+            "hidden_size": config.hidden_size,
+            "vocab_size": config.vocab_size,
+            "intermediate_size": getattr(config, "intermediate_size", moe_intermediate_size),
+            "hidden_act": config.hidden_act,
+            "rms_norm_eps": config.rms_norm_eps,
+            "tie_word_embeddings": tie_word_embeddings,
+            "rotary_config": RotaryConfig(
                 head_dim=head_dim,
                 rotary_dim=rotary_dim,
                 max_position=config.max_position_embeddings,
                 base=rope_theta,
                 scaling=rope_scaling,
             ),
-            num_experts=num_experts,
-            num_experts_per_tok=num_experts_per_tok,
-            moe_intermediate_size=moe_intermediate_size,
-            norm_topk_prob=norm_topk_prob,
-            model_type=model_type,
-            architectures=architectures,
-            hybrid=hybrid,
-            qwen4_runtime=Qwen4RuntimeConfig.from_env() if is_qwen4 else Qwen4RuntimeConfig(),
-        )
+            "num_experts": num_experts,
+            "num_experts_per_tok": num_experts_per_tok,
+            "moe_intermediate_size": moe_intermediate_size,
+            "norm_topk_prob": norm_topk_prob,
+            "model_type": model_type,
+            "architectures": architectures,
+        }
+        if is_qwen4:
+            from .qwen4_config import Qwen4Config
+
+            return Qwen4Config._from_hf(config, common, rope_parameters)
+        return cls(**common)

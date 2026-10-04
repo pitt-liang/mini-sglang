@@ -10,9 +10,11 @@ from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
-from minisgl.models.config import ModelConfig, Qwen4RuntimeConfig
+from minisgl.models.config import ModelConfig, RotaryConfig
+from minisgl.models.qwen4_config import Qwen4Config
 from minisgl.models.qwen4_ops import causal_conv, l2_norm, ngram_ids, rms_norm, rotary
 from minisgl.utils.hf import cached_load_hf_config
+from qwen4_test_utils import make_qwen4_config
 
 
 def independent_hf_reference():
@@ -68,12 +70,7 @@ class Qwen4OpsTest(unittest.TestCase):
         ):
             with self.subTest(cache=cache, requested=requested):
                 config = SimpleNamespace(
-                    model_config=SimpleNamespace(
-                        is_qwen4=True,
-                        is_moe=True,
-                        qwen4_runtime=Qwen4RuntimeConfig(reference=True, aligned=False),
-                        hybrid={"indexer_compress_ratio": 4},
-                    ),
+                    model_config=make_qwen4_config(reference=True, aligned=False),
                     attention_backend="auto",
                     moe_backend="fused",
                     dtype=torch.bfloat16,
@@ -140,9 +137,7 @@ class Qwen4OpsTest(unittest.TestCase):
         batch = SimpleNamespace(reqs=[req])
         ctx = SimpleNamespace(kv_cache=SimpleNamespace(device="cpu"))
         with patch("minisgl.attention.qwen4.get_global_ctx", return_value=ctx):
-            Qwen4Backend(
-                SimpleNamespace(qwen4_runtime=Qwen4RuntimeConfig(aligned=False))
-            ).prepare_metadata(batch)
+            Qwen4Backend(make_qwen4_config(aligned=False)).prepare_metadata(batch)
         req.cached_len, req.device_len = 9, 10
         self.assertEqual(batch.attn_metadata.spans, ((3, 5, 9, 0, 4),))
         self.assertEqual(batch.attn_metadata.last_indices.tolist(), [3])
@@ -152,6 +147,7 @@ class Qwen4OpsTest(unittest.TestCase):
         if not path or not Path(path).is_dir():
             self.skipTest("Set QWEN4_MODEL to a local Qwen4 checkpoint")
         c = ModelConfig.from_hf(cached_load_hf_config(path))
+        self.assertIsInstance(c, Qwen4Config)
         self.assertEqual(cached_load_hf_config(path).dtype, torch.bfloat16)
         self.assertTrue(c.is_qwen4 and c.is_moe and c.norm_topk_prob)
         self.assertEqual((c.num_layers, c.num_kv_layers, c.rotary_config.rotary_dim), (48, 12, 64))
@@ -165,10 +161,10 @@ class Qwen4OpsTest(unittest.TestCase):
 
         ref = independent_hf_reference()
         torch.manual_seed(5)
-        cfg = SimpleNamespace(
-            qwen4_runtime=Qwen4RuntimeConfig(reference=True, aligned=False),
+        cfg = make_qwen4_config(
+            reference=True,
+            aligned=False,
             hidden_size=32,
-            hybrid={"hc_count": 4, "hc_lowrank": 8},
             hc_count=4,
             hc_lowrank=8,
             rms_norm_eps=1e-6,
@@ -236,7 +232,6 @@ class Qwen4OpsTest(unittest.TestCase):
 
         ref = independent_hf_reference()
         cfg = SimpleNamespace(
-            qwen4_runtime=Qwen4RuntimeConfig(reference=True, aligned=False),
             num_experts=8,
             hidden_size=128,
             moe_intermediate_size=64,
@@ -280,22 +275,22 @@ class Qwen4OpsTest(unittest.TestCase):
             "linear_num_value_heads": 4,
             "linear_key_head_dim": 8,
             "linear_value_head_dim": 8,
-            "layer_types": ["full_attention"],
+            "layer_types": ("full_attention",),
             "linear_conv_kernel_dim": 4,
             "indexer_compress_ratio": 4,
             "indexer_head_dim": 8,
             "indexer_budget": 8,
-            "ple_layer_ids": [],
+            "ple_layer_ids": (),
             "eos_token_id": 17,
         }
-        cfg = SimpleNamespace(
-            qwen4_runtime=Qwen4RuntimeConfig(aligned=False),
-            hybrid=c,
+        cfg = make_qwen4_config(
+            aligned=False,
+            **c,
             num_kv_heads=2,
-            num_kv_layers=1,
+            num_layers=1,
             head_dim=32,
             rms_norm_eps=1e-6,
-            rotary_config=SimpleNamespace(rotary_dim=4, base=10000.0),
+            rotary_config=RotaryConfig(32, 4, 128, 10000.0, None),
         )
         tp = SimpleNamespace(rank=0, size=1)
         with (
@@ -433,7 +428,7 @@ class Qwen4PackingTest(unittest.TestCase):
                     shared_expert=SimpleNamespace(gate_proj=projection(5), up_proj=projection(6))
                 )
                 model = SimpleNamespace(
-                    runtime=Qwen4RuntimeConfig(aligned=aligned),
+                    config=make_qwen4_config(aligned=aligned),
                     model=SimpleNamespace(
                         layers=SimpleNamespace(
                             op_list=[SimpleNamespace(linear_attn=attn, self_attn=None, mlp=mlp)]
@@ -459,7 +454,7 @@ class Qwen4PackingTest(unittest.TestCase):
         from minisgl.models.qwen4_weight import pack_qwen4_weights
 
         with self.assertRaises(ValueError):
-            pack_qwen4_weights(SimpleNamespace(runtime=Qwen4RuntimeConfig()))
+            pack_qwen4_weights(SimpleNamespace(config=make_qwen4_config()))
 
 
 if __name__ == "__main__":

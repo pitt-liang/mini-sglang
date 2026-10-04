@@ -20,6 +20,7 @@ from minisgl.distributed import DistributedInfo
 from minisgl.engine import Engine
 from minisgl.kernel import qwen4_ops
 from minisgl.message import UserMsg
+from minisgl.models import Qwen4Config
 from minisgl.scheduler import Scheduler, SchedulerConfig
 from minisgl.scheduler.prefill import ChunkedReq
 from qwen4_test_utils import index_topk_deterministic
@@ -276,6 +277,8 @@ def main():
     )
     with selection:
         engine = Engine(config)
+        model_config = config.model_config
+        assert isinstance(model_config, Qwen4Config)
         try:
             ids = ([760, 6511, 314, 9338, 369] * ((args.length + 4) // 5))[: args.length]
             if args.prompt_pattern == "text":
@@ -354,8 +357,8 @@ def main():
                 "runtime": {
                     "tp_size": size,
                     "stable_numerics": config.qwen4_stable_numerics,
-                    "ple_storage": config.model_config.qwen4_runtime.ple_storage,
-                    "ple_prefetch": config.model_config.qwen4_runtime.ple_prefetch,
+                    "ple_storage": model_config.ple_storage,
+                    "ple_prefetch": model_config.ple_prefetch,
                     "page_size": config.page_size,
                     "checkpoint_interval": config.qwen4_checkpoint_interval,
                     "state_cache_mb": config.qwen4_state_cache_mb,

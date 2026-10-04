@@ -10,13 +10,13 @@ import qwen4_test_utils as oracle
 import torch
 import triton
 from minisgl.kernel import qwen4_ops as mini
-from minisgl.models.config import Qwen4RuntimeConfig
+from qwen4_test_utils import make_qwen4_config
 
 
 class TestNumericsSelection(unittest.TestCase):
     def test_ple_storage_and_prefetch_are_independent_validated_policies(self):
         with patch.dict(os.environ, {}, clear=True):
-            default = Qwen4RuntimeConfig.from_env()
+            default = make_qwen4_config().with_env_overrides()
             self.assertEqual(default.ple_storage, "gpu")
             self.assertFalse(default.ple_prefetch)
             for storage in ("gpu", "pinned"):
@@ -24,19 +24,19 @@ class TestNumericsSelection(unittest.TestCase):
                     os.environ.update(
                         MINISGL_QWEN4_PLE_STORAGE=storage, MINISGL_QWEN4_PLE_PREFETCH=prefetch
                     )
-                    policy = Qwen4RuntimeConfig.from_env()
+                    policy = make_qwen4_config().with_env_overrides()
                     self.assertEqual(policy.ple_storage, storage)
                     self.assertEqual(policy.ple_prefetch, prefetch == "1")
                     if storage == "pinned" or prefetch == "1":
                         with self.assertRaises(ValueError):
-                            policy.resolve(torch.device("cpu"))
+                            policy.resolve_runtime(torch.device("cpu"))
             os.environ["MINISGL_QWEN4_PLE_PREFETCH"] = "invalid"
             with self.assertRaises(ValueError):
-                Qwen4RuntimeConfig.from_env()
+                make_qwen4_config().with_env_overrides()
             os.environ["MINISGL_QWEN4_PLE_PREFETCH"] = "0"
             os.environ["MINISGL_QWEN4_PLE_STORAGE"] = "file"
             with self.assertRaises(ValueError):
-                Qwen4RuntimeConfig.from_env()
+                make_qwen4_config().with_env_overrides()
 
     def test_default_and_explicit_override(self):
         with (
@@ -46,51 +46,53 @@ class TestNumericsSelection(unittest.TestCase):
         ):
             os.environ.pop("MINISGL_QWEN4_REFERENCE", None)
             os.environ.pop("MINISGL_QWEN4_SGLANG_NUMERICS", None)
-            auto = Qwen4RuntimeConfig.from_env()
+            auto = make_qwen4_config().with_env_overrides()
             self.assertIsNone(auto.aligned)
-            first = auto.resolve(torch.device("cuda"))
+            first = auto.resolve_runtime(torch.device("cuda"))
             self.assertTrue(first.aligned)
             os.environ["MINISGL_QWEN4_SGLANG_NUMERICS"] = "0"
-            second = Qwen4RuntimeConfig.from_env().resolve(torch.device("cuda"))
+            second = make_qwen4_config().with_env_overrides().resolve_runtime(torch.device("cuda"))
             self.assertFalse(second.aligned)
             self.assertTrue(first.aligned)  # another model cannot change this policy
             os.environ["MINISGL_QWEN4_SGLANG_NUMERICS"] = "1"
             with self.assertRaises(ValueError):
-                Qwen4RuntimeConfig.from_env().resolve(torch.device("cpu"))
+                make_qwen4_config().with_env_overrides().resolve_runtime(torch.device("cpu"))
 
     def test_reference_and_unsupported_device(self):
         with patch.dict(os.environ, {"MINISGL_QWEN4_REFERENCE": "1"}, clear=True):
-            reference = Qwen4RuntimeConfig.from_env().resolve(torch.device("cpu"))
-        self.assertFalse(reference.enabled())
+            reference = (
+                make_qwen4_config().with_env_overrides().resolve_runtime(torch.device("cpu"))
+            )
+        self.assertFalse(reference.use_optimized_kernels())
         self.assertFalse(reference.aligned)
         with (
             patch("torch.cuda.get_device_capability", return_value=(9, 0)),
             patch("torch.version.cuda", "13.0"),
         ):
-            legacy = Qwen4RuntimeConfig().resolve(torch.device("cuda"))
-        self.assertTrue(legacy.enabled())
+            legacy = make_qwen4_config().resolve_runtime(torch.device("cuda"))
+        self.assertTrue(legacy.use_optimized_kernels())
         self.assertFalse(legacy.aligned)
 
     def test_policy_is_frozen_and_env_read_does_not_initialize_cuda(self):
         from dataclasses import FrozenInstanceError
 
         with patch("torch.cuda.get_device_capability", side_effect=AssertionError("CUDA queried")):
-            policy = Qwen4RuntimeConfig.from_env()
+            policy = make_qwen4_config().with_env_overrides()
         with self.assertRaises(FrozenInstanceError):
             policy.aligned = False
         with patch.dict(os.environ, {"MINISGL_QWEN4_SGLANG_NUMERICS": "invalid"}):
             with self.assertRaises(ValueError):
-                Qwen4RuntimeConfig.from_env()
+                make_qwen4_config().with_env_overrides()
 
     def test_backend_policies_are_independent(self):
         from minisgl.attention.qwen4 import Qwen4Backend
 
-        first = Qwen4Backend(SimpleNamespace(qwen4_runtime=Qwen4RuntimeConfig(aligned=True)))
-        second = Qwen4Backend(SimpleNamespace(qwen4_runtime=Qwen4RuntimeConfig(aligned=False)))
-        self.assertTrue(first.runtime.aligned)
-        self.assertFalse(second.runtime.aligned)
+        first = Qwen4Backend(make_qwen4_config(aligned=True))
+        second = Qwen4Backend(make_qwen4_config(aligned=False))
+        self.assertTrue(first.config.aligned)
+        self.assertFalse(second.config.aligned)
         with self.assertRaises(ValueError):
-            Qwen4Backend(SimpleNamespace(qwen4_runtime=Qwen4RuntimeConfig()))
+            Qwen4Backend(make_qwen4_config())
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -346,7 +348,7 @@ class TestSGLangNumerics(unittest.TestCase):
 
         selected = torch.arange(8, device="cuda").repeat(5, 1)
         lengths = torch.tensor([1, 3, 4, 7, 19], device="cuda")
-        backend = Qwen4Backend(SimpleNamespace(qwen4_runtime=Qwen4RuntimeConfig(aligned=True)))
+        backend = Qwen4Backend(make_qwen4_config(aligned=True))
         indices = backend.expand(selected, lengths // 4, lengths, None, 4)
         for row, length in enumerate(lengths.tolist()):
             torch.testing.assert_close(
