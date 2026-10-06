@@ -122,7 +122,7 @@ def test_model_backend_and_pool_consume_the_same_typed_config():
     config = make_qwen4_config()
     with (
         patch("minisgl.distributed.info._TP_INFO", DistributedInfo(0, 1)),
-        qwen4_execution(reference=True) as execution,
+        qwen4_execution() as execution,
         patch.object(
             StartupEnvVar, "read", side_effect=AssertionError("env re-read after startup")
         ),
@@ -160,8 +160,8 @@ def test_generic_config_cannot_construct_qwen4_components():
         create_attention_backend("qwen4", generic)
 
 
-@pytest.mark.parametrize("reference", [False, True])
-def test_engine_graph_defaults_use_execution_without_replacing_model_config(reference):
+@pytest.mark.parametrize("aligned", [False, True])
+def test_engine_graph_defaults_use_execution_without_replacing_model_config(aligned):
     from minisgl.engine import EngineConfig
     from minisgl.engine.engine import _adjust_config
 
@@ -169,21 +169,21 @@ def test_engine_graph_defaults_use_execution_without_replacing_model_config(refe
     config = EngineConfig("unused", DistributedInfo(0, 1), torch.bfloat16)
     object.__setattr__(config, "model_config", model_config)
     with (
-        qwen4_execution(reference=reference) as execution,
+        qwen4_execution(aligned=aligned) as execution,
         patch("minisgl.distributed.info._TP_INFO", config.tp_info),
     ):
         _adjust_config(config, execution)
     assert config.model_config is model_config
-    assert config.cuda_graph_max_bs == (0 if reference else 4)
+    assert config.cuda_graph_max_bs == 4
     assert config.attention_backend == "qwen4"
 
 
-def test_reference_execution_rejects_explicit_graph_capture():
+def test_engine_can_disable_graph_capture():
     from minisgl.engine import EngineConfig
     from minisgl.engine.engine import _adjust_config
 
-    config = EngineConfig("unused", DistributedInfo(0, 1), torch.bfloat16, cuda_graph_max_bs=4)
+    config = EngineConfig("unused", DistributedInfo(0, 1), torch.bfloat16, cuda_graph_max_bs=0)
     object.__setattr__(config, "model_config", make_qwen4_config())
-    with qwen4_execution(reference=True) as execution:
-        with pytest.raises(ValueError, match="does not support CUDA graphs"):
-            _adjust_config(config, execution)
+    with qwen4_execution() as execution:
+        _adjust_config(config, execution)
+    assert config.cuda_graph_max_bs == 0

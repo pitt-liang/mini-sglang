@@ -356,7 +356,6 @@ def main():
                 "output_tokens": args.output_tokens,
                 "runtime": {
                     "tp_size": size,
-                    "reference": engine.model.execution.reference,
                     "aligned": engine.model.execution.aligned,
                     "stable_numerics": config.qwen4_stable_numerics,
                     "ple_storage": engine.model.execution.ple_storage,

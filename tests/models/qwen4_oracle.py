@@ -1,7 +1,16 @@
-"""Plain PyTorch building blocks; also usable in CPU correctness tests."""
+"""Small test-only mathematical oracles; not an independent framework reference."""
 
 import torch
 import torch.nn.functional as F
+
+
+def gated_residual(op, residual):
+    norm = rms_norm(residual, op.hc_norm.weight, op.eps, op.h)
+    gate = F.silu(F.linear(norm, op.input_mix_weight_down.weight) / op.n)
+    gate = F.linear(gate, op.input_mix_weight_up.weight).sigmoid()
+    mixed = (gate * norm).view(-1, op.n, op.h).mean(1)
+    injection = F.linear(norm.float(), op.block_inject_weight.weight.float()).to(norm.dtype)
+    return mixed, 2 * (injection / op.n).sigmoid()
 
 
 def rms_norm(x, weight, eps=1e-6, group_size=None):
@@ -55,4 +64,4 @@ def ngram_ids(ids, history, multipliers, sizes, offsets, heads_per_ngram, eos):
         sl = slice((n - 1) * heads_per_ngram, n * heads_per_ngram)
         result.append(mixed[:, None].remainder(sizes[sl]) + offsets[sl])
     history.copy_(tokens[-history.numel() :])
-    return torch.cat(result, -1)[-ids.numel() :]
+    return torch.cat(result, -1)[history.numel() :]

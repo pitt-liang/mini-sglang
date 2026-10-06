@@ -2,7 +2,7 @@
 """Qwen4 production primitives and explicit legacy fallbacks.
 
 Unprefixed primitives implement the aligned numerical contract or are shared by
-both paths. legacy_* primitives retain the earlier BF16 reference contract.
+both paths. legacy_* primitives retain the earlier BF16 numerical contract.
 SGLang-derived operator provenance is in _qwen4_fla/README.md.
 """
 
@@ -15,6 +15,34 @@ import triton.language as tl
 from triton.language.extra.cuda import libdevice
 
 from .utils import load_jit
+
+
+# Shared production helpers (Torch where a fused replacement is not yet available).
+def rms_norm(x, weight, eps=1e-6, group_size=None):
+    shape = x.shape
+    y = x.float().reshape(*shape[:-1], -1, group_size or shape[-1])
+    y = y * torch.rsqrt(y.square().mean(-1, keepdim=True) + eps)
+    return (y.reshape(shape) * (1 + weight.float())).to(x.dtype)
+
+
+def rotary(x, positions, rotary_dim, base):
+    freq = base ** (-torch.arange(0, rotary_dim, 2, device=x.device).float() / rotary_dim)
+    angle = positions.float()[:, None] * freq[None, :]
+    angle = torch.cat((angle, angle), dim=-1)[:, None, :]
+    cos, sin = angle.cos().to(x.dtype), angle.sin().to(x.dtype)
+    a = x[..., :rotary_dim]
+    half = rotary_dim // 2
+    rotated = a * cos + torch.cat((-a[..., half:], a[..., :half]), -1) * sin
+    return torch.cat((rotated, x[..., rotary_dim:]), -1)
+
+
+def causal_conv(x, weight, history, dilation=1):
+    """x [T,C], weight [C,1,K], history [C,(K-1)*dilation]."""
+    full = torch.cat((history, x.T), dim=-1)
+    out = F.conv1d(full[None], weight, groups=x.shape[-1], dilation=dilation)
+    if history.shape[-1]:
+        history.copy_(full[:, -history.shape[-1] :])
+    return F.silu(out[0].T)
 
 
 # Shared helpers and legacy BF16 primitives.
@@ -541,7 +569,7 @@ def _hash(
             tl.store(O + row * (N - 1) * HEADS + shift * HEADS + h, 0, h < HEADS)
 
 
-def hash_decode(ids, history, multipliers, sizes, offsets, heads, eos, slots, valid):
+def _hash_decode(ids, history, multipliers, sizes, offsets, heads, eos, slots, valid):
     n = multipliers.numel()
     out = torch.empty((ids.numel(), (n - 1) * heads), device=ids.device, dtype=torch.int64)
     _hash[(ids.numel(),)](
@@ -558,6 +586,133 @@ def hash_decode(ids, history, multipliers, sizes, offsets, heads, eos, slots, va
         eos,
         tr.next_power_of_2(heads),
     )
+    return out
+
+
+@tr.jit
+def _hash_prefill(
+    IDS,
+    HISTORY,
+    MUL,
+    SIZE,
+    OFFSET,
+    SLOTS,
+    VALID,
+    CU,
+    O,
+    N: tl.constexpr,
+    HEADS: tl.constexpr,
+    EOS: tl.constexpr,
+    BT: tl.constexpr,
+    NH: tl.constexpr,
+):
+    row = tl.program_id(0)
+    start, end = tl.load(CU + row), tl.load(CU + row + 1)
+    t = tl.program_id(1) * BT + tl.arange(0, BT)
+    h = tl.arange(0, NH)
+    mask = start + t < end
+    if tl.load(VALID + row):
+        slot = tl.load(SLOTS + row)
+        token = tl.load(IDS + start + t, mask, 0).to(tl.int64)
+        mix = token * tl.load(MUL)
+        alive = tl.full((BT,), True, tl.int1)
+        for shift in tl.static_range(1, N):
+            p = t - shift
+            local = tl.load(IDS + start + p, mask & (p >= 0), 0).to(tl.int64)
+            old = tl.load(HISTORY + slot * (N - 1) + N - 1 + p, mask & (p < 0), 0)
+            previous = tl.where(p >= 0, local, old)
+            shifted = tl.where(alive, previous, EOS)
+            alive = alive & (previous != EOS)
+            mix = mix ^ (shifted * tl.load(MUL + shift))
+            index = (shift - 1) * HEADS + h
+            size = tl.load(SIZE + index, h < HEADS, 1)
+            rem = mix[:, None] % size[None, :]
+            rem = tl.where(rem < 0, rem + size[None, :], rem)
+            off = tl.load(OFFSET + index, h < HEADS, 0)
+            tl.store(
+                O + (start + t[:, None]) * (N - 1) * HEADS + index[None, :],
+                rem + off[None, :],
+                mask[:, None] & (h[None, :] < HEADS),
+            )
+    else:
+        for shift in tl.static_range(N - 1):
+            tl.store(
+                O + (start + t[:, None]) * (N - 1) * HEADS + shift * HEADS + h[None, :],
+                0,
+                mask[:, None] & (h[None, :] < HEADS),
+            )
+
+
+@tr.jit
+def _hash_update_history(IDS, HISTORY, SLOTS, VALID, CU, W: tl.constexpr, BW: tl.constexpr):
+    row = tl.program_id(0)
+    start, end = tl.load(CU + row), tl.load(CU + row + 1)
+    length = end - start
+    if tl.load(VALID + row) & (length > 0):
+        slot = tl.load(SLOTS + row)
+        j = tl.arange(0, BW)
+        p = length - W + j
+        token = tl.load(IDS + start + p, (j < W) & (p >= 0), 0).to(tl.int64)
+        old = tl.load(HISTORY + slot * W + W + p, (j < W) & (p < 0), 0)
+        # One writer per request, after *all* hash readers on the same stream.
+        tl.store(HISTORY + slot * W + j, tl.where(p >= 0, token, old), j < W)
+
+
+def ngram_ids(
+    ids: torch.Tensor,
+    history: torch.Tensor,
+    multipliers: torch.Tensor,
+    sizes: torch.Tensor,
+    offsets: torch.Tensor,
+    heads: int,
+    eos: int,
+    slots: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor | None = None,
+    max_extend_len: int | None = None,
+) -> torch.Tensor:
+    """Packed PLE hashes; update each request's raw history exactly once.
+
+    Decode retains the one-token fused fast path. Prefill computes against a
+    read-only initial history, then commits tails in a separate ordered launch.
+    Valid requests must own distinct history slots; padding may share slots.
+    """
+    if cu_seqlens is None:
+        return _hash_decode(ids, history, multipliers, sizes, offsets, heads, eos, slots, valid)
+    if max_extend_len is None or max_extend_len < 0:
+        raise ValueError("Prefill hash requires nonnegative max_extend_len")
+    n = multipliers.numel()
+    out = torch.empty((ids.numel(), (n - 1) * heads), device=ids.device, dtype=torch.int64)
+    rows = cu_seqlens.numel() - 1
+    if rows and max_extend_len:
+        _hash_prefill[(rows, tr.cdiv(max_extend_len, 32))](
+            ids,
+            history,
+            multipliers,
+            sizes,
+            offsets,
+            slots,
+            valid,
+            cu_seqlens,
+            out,
+            n,
+            heads,
+            eos,
+            32,
+            tr.next_power_of_2(heads),
+            num_warps=4,
+        )
+        _hash_update_history[(rows,)](
+            ids,
+            history,
+            slots,
+            valid,
+            cu_seqlens,
+            n - 1,
+            tr.next_power_of_2(n - 1),
+            num_warps=1,
+        )
     return out
 
 

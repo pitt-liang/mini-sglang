@@ -145,14 +145,14 @@ Qwen3.8-Flash-Next has an experimental native BF16 **text-only** path (GR, GDN,
 QSA, shared/routed MoE and PLE). It supports batched CUDA Graph decode,
 paged sparse prefill and FP32 recurrent state. The Qwen4 scheduler maps the default
 `--cache-type radix` to a hybrid prefix cache; `--cache-type naive` disables reuse.
-Vision, MTP and quantization are not supported. Optimized BF16 kernels are not bit-equivalent to
-the reference path; set `MINISGL_QWEN4_REFERENCE=1` and pass
-`--cuda-graph-max-bs 0` to select the eager reference.
+Vision, MTP and quantization are not supported. There is no internal reference
+model or CPU execution mode. `MINISGL_QWEN4_REFERENCE` has been removed; unset it
+(even `=0` is rejected). Use independent Transformers/SGLang tests for alignment.
 A GB200 numerical-alignment path is enabled by default on SM100/CUDA 13+.
 `MINISGL_QWEN4_SGLANG_NUMERICS=1` requires it explicitly; `=0` selects the older
-fast path. This is separate from the older mini reference switch.
-These switches are read into an immutable per-model policy at configuration time
-and resolved on the worker's device before model construction and weight packing;
+legacy fast path, which remains a production hardware-compatibility path.
+These switches are resolved into an immutable execution policy at worker startup,
+after selecting the device and before model construction and weight packing;
 changing the environment afterwards does not switch an existing model or graph.
 Alignment targets Torch dense GEMM, Triton MoE and FP32 recurrent state; stock
 sparse top-k tie ordering is nondeterministic. This does not imply performance
@@ -174,13 +174,17 @@ Set `QWEN4_MODEL` to a local checkpoint and `QWEN4_HF_SOURCE` to an independent
 Transformers `modeling_qwen4_exp.py` to enable their optional reference checks.
 SGLang operator parity tests skip when the reference framework is unavailable;
 it is not required in the production environment.
+For a dedicated parity job, set `QWEN4_REQUIRE_EXTERNAL_REFERENCE=1` and run both
+`test_qwen4.py` and `test_qwen4_sglang.py` in a separate reference environment with
+the external sources available. Missing references then fail instead of skipping.
+Test-only mathematical oracles are convenience checks, not independent ground truth.
 
 Qwen4 prefix reuse shares QSA KV/index pages and restores an immutable checkpoint
 of **all** GDN recurrent/conv and PLE conv/token-history states into a private
 request slot. Checkpoints are aligned to `lcm(page_size, 64)`, including a replay
 boundary before the last prompt token. The aligned runtime records FP32 GDN
 state inside a prefill chunk and gathers the matching GDN/PLE convolution windows,
-without splitting that forward. Legacy/reference runtimes stop at the boundary.
+without splitting that forward. The legacy runtime stops at the boundary.
 Splitting a radix edge does not invent an intermediate recurrent state; matching
 falls back to the deepest complete checkpoint. Decode state is not published.
 
@@ -192,17 +196,17 @@ architecture fields, not execution flags, a `hybrid` dictionary or a
 CUDA. Model layers, attention, and the KV pool consume `Qwen4Config` directly;
 generic models do not carry Qwen4-only fields.
 
-Execution flags are registered in `env.py`: `MINISGL_QWEN4_REFERENCE`,
-`MINISGL_QWEN4_SGLANG_NUMERICS`, `MINISGL_QWEN4_PLE_STORAGE`, and
+Execution flags are registered in `env.py`: `MINISGL_QWEN4_SGLANG_NUMERICS`,
+`MINISGL_QWEN4_PLE_STORAGE`, and
 `MINISGL_QWEN4_PLE_PREFETCH`. Unlike the older import-time env options, these are
 read and strictly validated at Qwen4 worker startup, after selecting its device.
-Boolean flags accept `0`/`1`; unset numerics selects SM100/CUDA 13+ automatically
-unless reference mode is requested. The engine retains the resolved values as
+Boolean flags accept `0`/`1`; unset numerics selects SM100/CUDA 13+ automatically.
+The engine retains the resolved values as
 an immutable internal `Qwen4Execution` snapshot in its execution context, shared
 by model layers, attention and weight packing. They are not model config fields
 or another user configuration API. Changing env after startup does not switch
 an existing model's storage, kernels, or captured graphs; restart the worker.
-Existing environment variable names and engine/scheduler CLI flags are unchanged.
+Other environment variable names and engine/scheduler CLI flags are unchanged.
 
 `--qwen4-state-cache-mb 1024` caps the per-rank GPU checkpoint pool separately
 from active request state. `--qwen4-checkpoint-interval 4096` controls periodic
@@ -271,12 +275,16 @@ Host memory bandwidth/topology and stream contention affect performance; offload
 does not guarantee lower latency on every device. No file-backed storage, CPU
 lookup worker, FP8 PLE or cross-DP embedding sharding is implemented.
 
-The implementation keeps model structure and eager/legacy/aligned dispatch in
+The implementation keeps model structure and legacy/aligned dispatch in
 `models/qwen4.py`, loading and packing in `models/qwen4_weight.py`, and GPU
 operators in `kernel/qwen4_ops.py` (older numerics use the `legacy_` prefix).
-`models/qwen4_ops.py` contains Torch reference helpers; GDN recurrence, sparse QSA,
-attention metadata and cache storage retain their separate modules. Test-only
-deterministic top-k and L2 helpers live under `tests/models`, not the runtime.
+Production Torch helpers (prefill convolution and legacy normalization/RoPE) also
+live in `kernel/qwen4_ops.py`; `models/qwen4_ops.py` has been removed. PLE uses
+Triton n-gram hashing for both packed variable-length prefill and decode: prefill
+reads immutable initial histories and commits final tails in a second launch;
+decode retains a fused one-token specialization. GDN recurrence, sparse QSA,
+attention metadata and cache storage retain their separate modules. Small
+mathematical oracles and deterministic test policies live under `tests/models`.
 
 Without pytest, run the Qwen4 unit tests using the project environment:
 
@@ -288,7 +296,7 @@ For a real-weight TP2 smoke test on two GB200 GPUs:
 
 ```bash
 smoke_dir=$(mktemp -d /tmp/minisgl-qwen4-smoke.XXXXXX)
-MINISGL_QWEN4_REFERENCE=0 MINISGL_QWEN4_SGLANG_NUMERICS=1 \
+MINISGL_QWEN4_SGLANG_NUMERICS=1 \
 MINISGL_QWEN4_MNNVL=1 OMP_NUM_THREADS=4 \
   .venv/bin/torchrun --standalone --nproc-per-node=2 tests/models/smoke_qwen4.py \
   --model /path/to/Qwen3.8-Flash-Next --output "$smoke_dir/current"

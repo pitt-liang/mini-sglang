@@ -91,9 +91,7 @@ class Engine:
 
             self.kv_cache.prefix_states = Qwen4StatePool(self.kv_cache, self.state_cache_slots)
             assert execution is not None
-            self.kv_cache.internal_checkpoints = (
-                execution.aligned and execution.use_optimized_kernels()
-            )
+            self.kv_cache.internal_checkpoints = execution.aligned
             if self.kv_cache.internal_checkpoints:
                 self.kv_cache.track_states = Qwen4StatePool(self.kv_cache, config.max_running_req)
             self.kv_cache.checkpoint_alignment = math.lcm(config.page_size, 64)
@@ -228,7 +226,7 @@ class Engine:
                 state_bytes += self.state_cache_slots * per_state
                 execution = self.ctx.qwen4_execution
                 assert execution is not None
-                if execution.aligned and execution.use_optimized_kernels():
+                if execution.aligned:
                     state_bytes += config.max_running_req * per_state
         num_pages = config.num_page_override
         if num_pages is None:
@@ -308,15 +306,11 @@ def _adjust_config(config: EngineConfig, execution: Qwen4Execution | None = None
             raise RuntimeError("Qwen4 engine requires resolved execution env")
         if config.attention_backend not in ("auto", "qwen4"):
             raise ValueError("Qwen4 requires the qwen4 hybrid attention backend")
-        if not execution.use_optimized_kernels() and (
-            config.cuda_graph_max_bs not in (None, 0) or config.cuda_graph_bs
-        ):
-            raise ValueError("Qwen4 eager baseline does not support CUDA graphs")
         if config.dtype != torch.bfloat16:
             raise ValueError("Qwen4 currently supports BF16 weights only")
         override("attention_backend", "qwen4")
         if config.cuda_graph_max_bs is None and not config.cuda_graph_bs:
-            override("cuda_graph_max_bs", 4 if execution.use_optimized_kernels() else 0)
+            override("cuda_graph_max_bs", 4)
         if config.page_size == 1:
             override("page_size", model_config.indexer_compress_ratio)
         if hasattr(config, "cache_type"):
@@ -332,10 +326,7 @@ def _adjust_config(config: EngineConfig, execution: Qwen4Execution | None = None
                 )
         if config.qwen4_stable_numerics is None:
             override("qwen4_stable_numerics", getattr(config, "cache_type", None) == "hybrid")
-        logger.warning_rank0(
-            "Qwen4 experimental BF16 text path: no vision/MTP/quantization; "
-            "MINISGL_QWEN4_REFERENCE=1 selects the eager reference implementation"
-        )
+        logger.warning_rank0("Qwen4 experimental BF16 text path: no vision/MTP/quantization")
 
     elif getattr(config, "cache_type", None) == "hybrid":
         raise ValueError("Hybrid prefix caching currently requires Qwen4")

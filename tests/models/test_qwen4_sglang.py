@@ -13,11 +13,19 @@ from minisgl.env import ENV, resolve_qwen4_execution
 from minisgl.kernel import qwen4_ops as mini
 from qwen4_test_utils import make_qwen4_config, qwen4_execution
 
+if os.environ.get("QWEN4_REQUIRE_EXTERNAL_REFERENCE") == "1":
+    if importlib.util.find_spec("sglang") is None or not torch.cuda.is_available():
+        raise RuntimeError("Independent SGLang parity requires the SGLang checkout and CUDA")
+
 
 class TestNumericsSelection(unittest.TestCase):
     def test_ple_storage_and_prefetch_are_independent_validated_policies(self):
-        with patch.dict(os.environ, {}, clear=True):
-            default = resolve_qwen4_execution(torch.device("cpu"))
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+            patch("torch.version.cuda", "13.0"),
+        ):
+            default = resolve_qwen4_execution(torch.device("cuda"))
             self.assertEqual(default.ple_storage, "gpu")
             self.assertFalse(default.ple_prefetch)
             for storage in ("gpu", "pinned"):
@@ -37,11 +45,11 @@ class TestNumericsSelection(unittest.TestCase):
                             resolve_qwen4_execution(torch.device("cpu"))
             os.environ["MINISGL_QWEN4_PLE_PREFETCH"] = "invalid"
             with self.assertRaises(ValueError):
-                resolve_qwen4_execution(torch.device("cpu"))
+                resolve_qwen4_execution(torch.device("cuda"))
             os.environ["MINISGL_QWEN4_PLE_PREFETCH"] = "0"
             os.environ["MINISGL_QWEN4_PLE_STORAGE"] = "file"
             with self.assertRaises(ValueError):
-                resolve_qwen4_execution(torch.device("cpu"))
+                resolve_qwen4_execution(torch.device("cuda"))
 
     def test_default_and_explicit_override(self):
         with (
@@ -64,15 +72,14 @@ class TestNumericsSelection(unittest.TestCase):
 
     def test_reference_and_unsupported_device(self):
         with patch.dict(os.environ, {"MINISGL_QWEN4_REFERENCE": "1"}, clear=True):
-            reference = resolve_qwen4_execution(torch.device("cpu"))
-        self.assertFalse(reference.use_optimized_kernels())
-        self.assertFalse(reference.aligned)
+            with self.assertRaisesRegex(ValueError, "has been removed"):
+                resolve_qwen4_execution(torch.device("cuda"))
         with (
+            patch.dict(os.environ, {}, clear=True),
             patch("torch.cuda.get_device_capability", return_value=(9, 0)),
             patch("torch.version.cuda", "13.0"),
         ):
             legacy = resolve_qwen4_execution(torch.device("cuda"))
-        self.assertTrue(legacy.use_optimized_kernels())
         self.assertFalse(legacy.aligned)
 
     def test_policy_is_frozen_and_env_read_does_not_initialize_cuda(self):
@@ -81,14 +88,17 @@ class TestNumericsSelection(unittest.TestCase):
             patch("torch.cuda.get_device_capability", side_effect=AssertionError("CUDA queried")),
         ):
             self.assertIsNone(ENV.QWEN4_SGLANG_NUMERICS.read())
-            execution = resolve_qwen4_execution(torch.device("cpu"))
+            with self.assertRaisesRegex(ValueError, "requires a CUDA device"):
+                resolve_qwen4_execution(torch.device("cpu"))
+        with qwen4_execution() as execution:
+            pass
         with self.assertRaises(AttributeError):
             execution.aligned = True
         for name in ("REFERENCE", "SGLANG_NUMERICS", "PLE_STORAGE", "PLE_PREFETCH"):
             key = "MINISGL_QWEN4_" + name
             with self.subTest(flag=key), patch.dict(os.environ, {key: "invalid"}, clear=True):
                 with self.assertRaisesRegex(ValueError, key):
-                    resolve_qwen4_execution(torch.device("cpu"))
+                    resolve_qwen4_execution(torch.device("cuda"))
 
     def test_backend_policies_are_independent(self):
         from minisgl.attention.qwen4 import Qwen4Backend
@@ -555,6 +565,7 @@ class TestSGLangNumerics(unittest.TestCase):
             spans=((2, 0, 5, 0, 5),),
             cu_seqlens=torch.tensor([0, 5], device="cuda", dtype=torch.int32),
             track_offsets=(),
+            track_chunk_idx=None,
         )
         batch = SimpleNamespace(is_decode=False, is_prefill=True, attn_metadata=meta)
         ctx = SimpleNamespace(batch=batch, kv_cache=pool)

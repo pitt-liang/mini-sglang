@@ -111,7 +111,6 @@ class EnvClassSingleton:
     PYNCCL_MAX_BUFFER_SIZE = EnvMem(1024**3)
 
     # Qwen4 startup flags: read together after the worker selects its device.
-    QWEN4_REFERENCE = StartupEnvVar(False, _strict_bool)
     QWEN4_SGLANG_NUMERICS = StartupEnvVar[bool | None](None, _strict_bool)
     QWEN4_PLE_STORAGE = StartupEnvVar[Literal["gpu", "pinned"]]("gpu", _ple_storage)
     QWEN4_PLE_PREFETCH = StartupEnvVar(False, _strict_bool)
@@ -141,20 +140,22 @@ class Qwen4Execution(NamedTuple):
     re-read env during execution: packing and captured graphs depend on it.
     """
 
-    reference: bool
     aligned: bool
     ple_storage: Literal["gpu", "pinned"]
     ple_prefetch: bool
-
-    def use_optimized_kernels(self, x: torch.Tensor | None = None) -> bool:
-        return not self.reference and (x is None or x.is_cuda)
 
 
 def resolve_qwen4_execution(device: torch.device) -> Qwen4Execution:
     """Called once per Qwen4 worker, before construction, packing and capture."""
     import torch
 
-    reference = ENV.QWEN4_REFERENCE.read()
+    if "MINISGL_QWEN4_REFERENCE" in os.environ:
+        raise ValueError(
+            "MINISGL_QWEN4_REFERENCE has been removed; unset it and use external "
+            "Transformers/SGLang tests for reference validation"
+        )
+    if device.type != "cuda":
+        raise ValueError("Qwen4 execution requires a CUDA device")
     requested = ENV.QWEN4_SGLANG_NUMERICS.read()
     storage = ENV.QWEN4_PLE_STORAGE.read()
     prefetch = ENV.QWEN4_PLE_PREFETCH.read()
@@ -166,7 +167,5 @@ def resolve_qwen4_execution(device: torch.device) -> Qwen4Execution:
     )
     if requested is True and not supported:
         raise ValueError("Qwen4 aligned kernels currently require SM100 and CUDA 13+")
-    if device.type != "cuda" and (storage == "pinned" or prefetch):
-        raise ValueError("Qwen4 PLE offload/prefetch requires a CUDA device")
-    aligned = (supported and not reference) if requested is None else requested
-    return Qwen4Execution(reference, aligned, storage, prefetch)
+    aligned = supported if requested is None else requested
+    return Qwen4Execution(aligned, storage, prefetch)

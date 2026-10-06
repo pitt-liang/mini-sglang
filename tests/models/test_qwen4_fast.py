@@ -2,10 +2,10 @@
 
 import unittest
 
+import qwen4_oracle as ref
 import torch
 from minisgl.kernel import qwen4_ops as fast
 from minisgl.kernel.qwen4 import gated_delta_decode, gated_delta_rule
-from minisgl.models import qwen4_ops as ref
 from qwen4_test_utils import make_qwen4_config, qwen4_execution
 
 
@@ -136,6 +136,9 @@ class FastTests(unittest.TestCase):
                         attn_metadata=SimpleNamespace(
                             spans=[(0, chunk * 4, 4, 0, 4), (1, chunk * 3, 3, 4, 7)],
                             track_offsets=(),
+                            slots=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+                            valid=torch.ones(2, device="cuda", dtype=torch.bool),
+                            cu_seqlens=torch.tensor([0, 4, 7], device="cuda", dtype=torch.int32),
                         ),
                     )
                     result.extend(
@@ -145,6 +148,7 @@ class FastTests(unittest.TestCase):
                     is_prefill=False,
                     input_ids=torch.tensor([7, 2, 0, 0], device="cuda", dtype=torch.int32),
                     attn_metadata=SimpleNamespace(
+                        spans=(),
                         slots=torch.tensor([1, 0, 2, 2], device="cuda", dtype=torch.int32),
                         valid=torch.tensor([True, True, False, False], device="cuda"),
                     ),
@@ -278,8 +282,8 @@ class FastTests(unittest.TestCase):
         ]:
             obj.weight = self.tensor(*obj.weight.shape) * 0.01
         x, y = self.tensor(4, 10240), self.tensor(4, 2560)
-        mixed, gate = op._forward_eager(x)
-        expected = op._combine_eager(x, y, gate)
+        mixed, gate = ref.gated_residual(op, x)
+        expected = (x.view(-1, op.n, op.h) + gate[..., None] * y[:, None]).flatten(1)
         actual, norm = op.forward(x)
         torch.testing.assert_close(actual, mixed, atol=0.008, rtol=0.02)
         torch.testing.assert_close(op.combine(x, y, norm), expected, atol=0.032, rtol=0.02)
@@ -350,9 +354,66 @@ class FastTests(unittest.TestCase):
                 ref.ngram_ids(ids[i : i + 1], expected[s], mul, sizes, offsets, 2, eos)
                 for i, s in enumerate([2, 0])
             ]
-            actual = fast.hash_decode(ids, hist, mul, sizes, offsets, 2, eos, slots, valid)
+            actual = fast.ngram_ids(ids, hist, mul, sizes, offsets, 2, eos, slots, valid)
             torch.testing.assert_close(actual[:2], torch.cat(ys), atol=0, rtol=0)
             torch.testing.assert_close(hist, expected, atol=0, rtol=0)
+
+    def test_prefill_hash_ragged_chunks_and_overflow(self):
+        eos = 17
+        for n in (2, 3, 4):
+            for heads in (1, 3):
+                slots = torch.tensor([2, 0, 3, 1, 1], device="cuda", dtype=torch.int32)
+                valid = torch.tensor([True, True, True, False, False], device="cuda")
+                hist = torch.randint(0, 23, (4, n - 1), device="cuda")
+                hist[2].fill_(eos)
+                expected = hist.clone()
+                mul = torch.tensor(
+                    [2**62 + 7, -(2**61) + 9, 991234567890123, 31][:n], device="cuda"
+                )
+                sizes = torch.arange((n - 1) * heads, device="cuda") * 2 + 101
+                offsets = sizes.cumsum(0) - sizes
+                # Multi-CTA, short-tail, empty requests and invalid slots sharing history.
+                for lengths in ([65, 1, 33, 2, 1], [1, 3, 0, 1, 0], [0, 0, 0, 0, 0]):
+                    cu = torch.tensor(
+                        [0, *torch.tensor(lengths).cumsum(0).tolist()],
+                        device="cuda",
+                        dtype=torch.int32,
+                    )
+                    ids = torch.randint(
+                        0, 200000, (sum(lengths),), device="cuda", dtype=torch.int32
+                    )
+                    ids[::5] = eos
+                    wanted = torch.zeros(
+                        (ids.numel(), sizes.numel()), device="cuda", dtype=torch.int64
+                    )
+                    start = 0
+                    for row, length in enumerate(lengths):
+                        if row < 3 and length:
+                            wanted[start : start + length] = ref.ngram_ids(
+                                ids[start : start + length],
+                                expected[[2, 0, 3][row]],
+                                mul,
+                                sizes,
+                                offsets,
+                                heads,
+                                eos,
+                            )
+                        start += length
+                    actual = fast.ngram_ids(
+                        ids,
+                        hist,
+                        mul,
+                        sizes,
+                        offsets,
+                        heads,
+                        eos,
+                        slots,
+                        valid,
+                        cu_seqlens=cu,
+                        max_extend_len=max(lengths),
+                    )
+                    torch.testing.assert_close(actual, wanted, atol=0, rtol=0)
+                    torch.testing.assert_close(hist, expected, atol=0, rtol=0)
 
     def test_sparse_decode(self):
         import torch.nn.functional as F

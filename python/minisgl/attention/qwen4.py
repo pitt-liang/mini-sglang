@@ -3,8 +3,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from minisgl.core import get_global_ctx, get_qwen4_execution
+from minisgl.kernel.qwen4_ops import rms_norm, rotary
 from minisgl.models.qwen4_config import Qwen4Config
-from minisgl.models.qwen4_ops import rms_norm, rotary
 
 from .base import BaseAttnBackend, BaseAttnMetadata
 
@@ -25,12 +25,16 @@ class Qwen4Metadata(BaseAttnMetadata):
         return self.last_indices[:bs]
 
 
-class Qwen4ReferenceBackend(BaseAttnBackend):
+class Qwen4Backend(BaseAttnBackend):
     def __init__(self, config: Qwen4Config) -> None:
         if not isinstance(config, Qwen4Config):
             raise TypeError("Qwen4 attention requires Qwen4Config")
         self.config: Qwen4Config = config
         self.execution = get_qwen4_execution()
+
+        from minisgl.kernel.qwen4_qsa import SparseDecode
+
+        self.aligned_decode = SparseDecode()
 
     def prepare_metadata(self, batch):
         spans, offset = [], 0
@@ -59,103 +63,6 @@ class Qwen4ReferenceBackend(BaseAttnBackend):
                     device=pool.device,
                 )
 
-    def forward(self, q, k, v, layer_id, batch):
-        raise RuntimeError("Qwen4 requires indexer keys as well as core Q/K/V")
-
-    def qsa(self, q, k, v, iq, raw_keys, index_norm, layer_id):
-        ctx, c = get_global_ctx(), self.config
-        batch, pool = ctx.batch, ctx.kv_cache
-        pool.store_kv(k, v, batch.out_loc, layer_id)
-        kc = pool.k_cache(layer_id).flatten(0, 1)
-        vc = pool.v_cache(layer_id).flatten(0, 1)
-        li = pool.layer_map[layer_id]
-        ratio, budget = c.indexer_compress_ratio, c.indexer_budget
-        out = torch.empty_like(q)
-        rc = self.config.rotary_config
-        for slot, cached, end, a, b in batch.attn_metadata.spans:
-            past = cached % ratio
-            raw = torch.cat((pool.pending[li, slot, :past], raw_keys[a:b]))
-            complete = raw.shape[0] // ratio
-            if complete:
-                pooled = (
-                    raw[: complete * ratio].view(complete, ratio, -1).float().mean(1).to(raw.dtype)
-                )
-                starts = torch.arange(
-                    cached - past, cached - past + complete * ratio, ratio, device=q.device
-                )
-                pooled = rotary(
-                    rms_norm(pooled, index_norm, self.config.rms_norm_eps)[:, None],
-                    starts,
-                    rc.rotary_dim,
-                    rc.base,
-                )[:, 0]
-                locations = ctx.page_table[slot, starts].long() // ratio
-                pool.index_keys[li, locations] = pooled
-            tail = raw[complete * ratio :]
-            pool.pending[li, slot, : tail.shape[0]].copy_(tail)
-            locations = ctx.page_table[slot, :end].long()
-            keys, values = kc[locations], vc[locations]
-            dense_count = max(0, min(b - a, budget - cached))
-            if dense_count:
-                dense_end = cached + dense_count
-                mask = (
-                    torch.arange(dense_end, device=q.device)[None, :]
-                    <= torch.arange(cached, dense_end, device=q.device)[:, None]
-                )
-                result = F.scaled_dot_product_attention(
-                    q[a : a + dense_count].transpose(0, 1)[None],
-                    keys[:dense_end].transpose(0, 1)[None],
-                    values[:dense_end].transpose(0, 1)[None],
-                    attn_mask=mask[None, None],
-                    enable_gqa=True,
-                )
-                out[a : a + dense_count] = result[0].transpose(0, 1)
-            if dense_count == b - a:
-                continue
-            # Eager baseline, bounded attention scratch. All full KV remains cached.
-            block_locs = locations[: end // ratio * ratio : ratio] // ratio
-            block_keys = pool.index_keys[li, block_locs].float()
-            for t in range(dense_count, b - a):
-                visible = cached + t + 1
-                nb = visible // ratio
-                if nb > budget // ratio:
-                    score = (iq[a + t].float() @ block_keys[:nb].T).relu().sum(0)
-                    selected = score.topk(budget // ratio).indices
-                else:
-                    selected = torch.arange(nb, device=q.device)
-                selected = (
-                    selected[:, None] * ratio + torch.arange(ratio, device=q.device)
-                ).flatten()
-                selected = torch.cat((selected, torch.arange(nb * ratio, visible, device=q.device)))
-                result = F.scaled_dot_product_attention(
-                    q[a + t][None, :, None],
-                    keys[selected].transpose(0, 1)[None],
-                    values[selected].transpose(0, 1)[None],
-                    enable_gqa=True,
-                )
-                out[a + t] = result[0, :, 0]
-        return out
-
-    def init_capture_graph(self, max_seq_len, bs_list):
-        if bs_list:
-            raise ValueError("Qwen4 eager backend requires --cuda-graph-max-bs 0")
-
-    def prepare_for_capture(self, batch):
-        raise ValueError("Qwen4 CUDA graphs are not implemented")
-
-    def prepare_for_replay(self, batch):
-        raise ValueError("Qwen4 CUDA graphs are not implemented")
-
-
-class Qwen4Backend(Qwen4ReferenceBackend):
-    def __init__(self, config: Qwen4Config) -> None:
-        super().__init__(config)
-        from minisgl.kernel.qwen4_qsa import SparseDecode
-
-        self.aligned_decode = SparseDecode()
-
-    def prepare_metadata(self, batch):
-        super().prepare_metadata(batch)
         m = batch.attn_metadata
         device = get_global_ctx().kv_cache.device
         reqs = getattr(batch, "padded_reqs", batch.reqs)
@@ -167,9 +74,10 @@ class Qwen4Backend(Qwen4ReferenceBackend):
                 [0] + [span[-1] for span in m.spans], device=device, dtype=torch.int32
             )
 
+    def forward(self, q, k, v, layer_id, batch):
+        raise RuntimeError("Qwen4 requires indexer keys as well as core Q/K/V")
+
     def init_capture_graph(self, max_seq_len, bs_list):
-        if not self.execution.use_optimized_kernels():
-            return super().init_capture_graph(max_seq_len, bs_list)
         device = get_global_ctx().kv_cache.device
         n = max(bs_list)
         self.graph_metadata = Qwen4Metadata(
@@ -194,8 +102,6 @@ class Qwen4Backend(Qwen4ReferenceBackend):
         dst.valid[:n].copy_(src.valid)
 
     def qsa(self, q, k, v, iq, raw_keys, index_norm, layer_id):
-        if not self.execution.use_optimized_kernels():
-            return super().qsa(q, k, v, iq, raw_keys, index_norm, layer_id)
         from minisgl.kernel.qwen4_qsa import (
             compress_decode,
             index_scores_decode,
@@ -293,7 +199,7 @@ class Qwen4Backend(Qwen4ReferenceBackend):
             tail = raw[complete * ratio :]
             pool.pending[li, slot, : tail.shape[0]].copy_(tail)
             # Before the sparse budget is reached QSA is exactly dense causal
-            # attention. Keep the reference SDPA path for its numerical contract
+            # attention. Keep the legacy SDPA path for its numerical contract
             # and efficient multi-query prefill tiles.
             dense_count = max(0, min(b - a, budget - cached))
             if self.execution.aligned:

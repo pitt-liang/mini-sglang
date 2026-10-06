@@ -65,7 +65,7 @@ def make_qwen4_config(**overrides) -> Qwen4Config:
 def qwen4_execution(**overrides):
     """Install an isolated worker snapshot while constructing test components."""
     ctx = Context(1)
-    ctx.qwen4_execution = Qwen4Execution(False, False, "gpu", False)._replace(**overrides)
+    ctx.qwen4_execution = Qwen4Execution(False, "gpu", False)._replace(**overrides)
     with patch("minisgl.core._GLOBAL_CTX", ctx):
         yield ctx.qwen4_execution
 

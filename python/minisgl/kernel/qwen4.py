@@ -1,6 +1,6 @@
 """Qwen4 recurrent kernel. State is FP32 [value_head, value_dim, key_dim].
 
-This deliberately small eager baseline supports arbitrary prefill chunk lengths.
+This portable production recurrence supports arbitrary prefill chunk lengths.
 It does not require FlashInfer's CUDA-13-only Blackwell prefill implementation.
 """
 

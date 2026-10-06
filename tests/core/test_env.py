@@ -27,19 +27,28 @@ def test_worker_reads_current_env_once_and_keeps_a_snapshot(monkeypatch):
     for name in ("REFERENCE", "SGLANG_NUMERICS", "PLE_STORAGE", "PLE_PREFETCH"):
         monkeypatch.delenv("MINISGL_QWEN4_" + name, raising=False)
     # ENV has already been imported: late startup env must still take effect.
-    monkeypatch.setenv("MINISGL_QWEN4_REFERENCE", "1")
+    monkeypatch.setenv("MINISGL_QWEN4_SGLANG_NUMERICS", "1")
     with (
-        patch.object(ENV.QWEN4_REFERENCE, "read", wraps=ENV.QWEN4_REFERENCE.read) as read,
-        patch("torch.cuda.get_device_capability", side_effect=AssertionError("CUDA queried")),
+        patch.object(
+            ENV.QWEN4_SGLANG_NUMERICS, "read", wraps=ENV.QWEN4_SGLANG_NUMERICS.read
+        ) as read,
+        patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        patch("torch.version.cuda", "13.0"),
     ):
-        first = resolve_qwen4_execution(torch.device("cpu"))
+        first = resolve_qwen4_execution(torch.device("cuda"))
         read.assert_called_once_with()
-    monkeypatch.setenv("MINISGL_QWEN4_REFERENCE", "0")
-    second = resolve_qwen4_execution(torch.device("cpu"))
-    assert first.reference and not first.use_optimized_kernels()
-    assert not second.reference and second.use_optimized_kernels()
+        monkeypatch.setenv("MINISGL_QWEN4_SGLANG_NUMERICS", "0")
+        second = resolve_qwen4_execution(torch.device("cuda"))
+    assert first.aligned and not second.aligned
     with pytest.raises(AttributeError):
-        first.reference = False
+        first.aligned = False
+
+
+@pytest.mark.parametrize("value", ["0", "1", "invalid"])
+def test_removed_reference_flag_requires_migration(value, monkeypatch):
+    monkeypatch.setenv("MINISGL_QWEN4_REFERENCE", value)
+    with pytest.raises(ValueError, match="has been removed; unset it"):
+        resolve_qwen4_execution(torch.device("cuda"))
 
 
 @pytest.mark.parametrize("capability,cuda", [((9, 0), "13.0"), ((10, 0), "12.9"), ((10, 0), None)])

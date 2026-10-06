@@ -1,7 +1,7 @@
 """Native BF16 text path for Qwen3.8-Flash-Next (Qwen4Exp).
 
 Explicit per-model policy, native graph decode, GPU/UVA PLE lookup overlap and TP.
-Each layer owns its eager/legacy/aligned forwards; classes are never replaced.
+Each layer owns its production prefill/decode paths and aligned/legacy kernels.
 Visual inputs, MTP and quantization are not enabled.
 """
 
@@ -18,13 +18,13 @@ from minisgl.kernel.qwen4 import (
     prefill_delta,
     prefill_delta_pool,
 )
+from minisgl.kernel.qwen4_ops import causal_conv, rms_norm
 from minisgl.layers import BaseOP, LinearColParallelMerged, LinearOProj, LinearReplicated, MoELayer
 from minisgl.layers.base import OPList
 from minisgl.layers.embedding import ParallelLMHead, VocabParallelEmbedding
 
 from .base import BaseLLMModel
 from .qwen4_config import Qwen4Config
-from .qwen4_ops import causal_conv, l2_norm, ngram_ids, rms_norm, rotary
 
 
 def _prefill_linear(ctx):
@@ -68,26 +68,7 @@ class GatedResidual(BaseOP):
         self.input_mix_weight_up = LinearReplicated(config.hc_lowrank, width, False)
         self.block_inject_weight = NarrowLinear(width, self.n, False) if combine else None
 
-    def _forward_eager(self, residual):
-        norm = rms_norm(residual, self.hc_norm.weight, self.eps, self.h)
-        gate = F.silu(self.input_mix_weight_down.forward(norm) / self.n)
-        gate = self.input_mix_weight_up.forward(gate).sigmoid()
-        mixed = (gate * norm).view(-1, self.n, self.h).mean(1)
-        injection = (
-            None
-            if self.block_inject_weight is None
-            else (2 * (self.block_inject_weight.forward(norm) / self.n).sigmoid())
-        )
-        return mixed, injection
-
-    def _combine_eager(self, residual, output, injection):
-        return (residual.view(-1, self.n, self.h) + injection[..., None] * output[:, None]).flatten(
-            1
-        )
-
     def forward(self, residual):
-        if not self.execution.use_optimized_kernels(residual):
-            return self._forward_eager(residual)
         if self.execution.aligned:
             normed = ops.grouped_norm(residual, self.hc_norm.weight, self.h, self.eps)
             # Cache hits change GEMM row counts. Both cuBLAS and the fused
@@ -139,8 +120,6 @@ class GatedResidual(BaseOP):
         return mixed, normed
 
     def combine(self, residual, output, injection):
-        if not self.execution.use_optimized_kernels(residual):
-            return self._combine_eager(residual, output, injection)
         if self.execution.aligned:
             return ops.gr_combine(residual, output, injection, self.block_inject_weight.weight)
         return ops.legacy_gr_combine(residual, output, injection, self.block_inject_weight.weight)
@@ -166,42 +145,7 @@ class GatedDeltaNet(BaseOP):
         self.norm = Weight(self.dv)
         self.out_proj = LinearOProj(vd, h, False)
 
-    def _forward_eager(self, x):
-        from minisgl.kernel.qwen4 import gated_delta_rule
-
-        ctx = get_global_ctx()
-        qkv = self.in_proj_qkv.forward(x)
-        z = self.in_proj_z.forward(x).view(-1, self.hv, self.dv)
-        # A_log and dt_bias are converted to FP32 by the streaming loader.
-        decay = -self.A_log.float().exp() * F.softplus(
-            self.in_proj_a.forward(x).float() + self.dt_bias.float()
-        )
-        beta = self.in_proj_b.forward(x).sigmoid()
-        output = torch.empty_like(z)
-        kd, vd = self.hk * self.dk, self.hv * self.dv
-        for slot, _, _, a, b in ctx.batch.attn_metadata.spans:
-            mixed = causal_conv(
-                qkv[a:b], self.conv1d.weight, ctx.kv_cache.conv[self.layer_id][slot]
-            )
-            q, k, v = mixed.split((kd, kd, vd), -1)
-            q, k = [l2_norm(t.reshape(-1, self.hk, self.dk)) for t in (q, k)]
-            output[a:b] = gated_delta_rule(
-                q,
-                k,
-                v.reshape(-1, self.hv, self.dv),
-                decay[a:b],
-                beta[a:b],
-                ctx.kv_cache.recurrent[self.layer_id][slot],
-            )
-        y = output.float()
-        y = (y * torch.rsqrt(y.square().mean(-1, keepdim=True) + self.eps)).to(x.dtype)
-        y = y * self.norm.weight  # direct scale, NOT zero-centered Gemma RMSNorm
-        y = (y.float() * z.float().sigmoid()).to(x.dtype)
-        return self.out_proj.forward(y.flatten(1))
-
     def forward(self, x):
-        if not self.execution.use_optimized_kernels(x):
-            return self._forward_eager(x)
         if self.execution.aligned:
             return self.forward_aligned(x)
         ctx = get_global_ctx()
@@ -390,40 +334,7 @@ class QSAAttention(BaseOP):
         self.o_proj = LinearOProj(config.num_qo_heads * d, h, False)
         self.indexer = QSAIndexer(config)
 
-    def _forward_eager(self, x):
-        ctx, rc = get_global_ctx(), self.config.rotary_config
-        positions = ctx.batch.positions
-        q, gate = self.q_proj.forward(x).view(-1, self.hq, 2 * self.dim).chunk(2, -1)
-        k = self.k_proj.forward(x).view(-1, self.hkv, self.dim)
-        v = self.v_proj.forward(x).view(-1, self.hkv, self.dim)
-        q = rotary(
-            rms_norm(q, self.q_norm.weight, self.config.rms_norm_eps),
-            positions,
-            rc.rotary_dim,
-            rc.base,
-        )
-        k = rotary(
-            rms_norm(k, self.k_norm.weight, self.config.rms_norm_eps),
-            positions,
-            rc.rotary_dim,
-            rc.base,
-        )
-        indexer = self.indexer
-        iq, ik = self.indexer.index_qk_proj.forward(x).split(
-            (indexer.heads * indexer.dim, indexer.dim), -1
-        )
-        iq = rms_norm(
-            iq.view(-1, indexer.heads, indexer.dim),
-            indexer.q_layernorm.weight,
-            self.config.rms_norm_eps,
-        )
-        iq = rotary(iq, positions, rc.rotary_dim, rc.base)
-        out = ctx.attn_backend.qsa(q, k, v, iq, ik, indexer.k_layernorm.weight, self.layer_id)
-        return self.o_proj.forward((out * gate.sigmoid()).flatten(1))
-
     def forward(self, x):
-        if not self.execution.use_optimized_kernels(x):
-            return self._forward_eager(x)
         ctx, rc = get_global_ctx(), self.config.rotary_config
         pos = ctx.batch.positions
         linear = _prefill_linear(ctx)
@@ -490,15 +401,7 @@ class SparseMoE(BaseOP):
         self.shared_expert = SharedMLP(config.hidden_size, config.shared_expert_intermediate_size)
         self.shared_expert_gate = NarrowLinear(config.hidden_size, 1, False)
 
-    def _forward_eager(self, x):
-        # The existing fused MoE backend reuses x as its output buffer.
-        shared = self.shared_expert.forward(x) * self.shared_expert_gate.forward(x).sigmoid()
-        routed = self.experts.forward(x, self.gate.forward(x))
-        return routed + shared
-
     def forward(self, x):
-        if not self.execution.use_optimized_kernels(x):
-            return self._forward_eager(x)
         if self.execution.aligned:
             from minisgl.layers import silu_and_mul
             from minisgl.moe.fused import fused_experts_impl
@@ -619,37 +522,23 @@ class PLE(BaseOP):
         if self.execution.ple_prefetch:
             self._prefetch_stream = torch.cuda.Stream(device=device)
 
-    def prepare_ids(self):
+    def prepare_ids(self) -> torch.Tensor:
         """Advance token history exactly once, whether lookup is prefetched or not."""
-        ctx, cfg = get_global_ctx(), self.config
-        c, pe = cfg, self.ple_embedding
-        if self.execution.use_optimized_kernels(ctx.batch.input_ids) and not ctx.batch.is_prefill:
-            m = ctx.batch.attn_metadata
-            return ops.hash_decode(
-                ctx.batch.input_ids,
-                ctx.kv_cache.ple_history[self.layer_id],
-                pe.layer_multipliers,
-                pe.ngram_heads_vocab_sizes,
-                pe.ngram_heads_offsets,
-                pe.heads,
-                c.eos_token_id,
-                m.slots,
-                m.valid,
-            ).flatten()
-        ids = []
-        for slot, _, _, a, b in ctx.batch.attn_metadata.spans:
-            ids.append(
-                ngram_ids(
-                    ctx.batch.input_ids[a:b],
-                    ctx.kv_cache.ple_history[self.layer_id][slot],
-                    pe.layer_multipliers,
-                    pe.ngram_heads_vocab_sizes,
-                    pe.ngram_heads_offsets,
-                    pe.heads,
-                    c.eos_token_id,
-                )
-            )
-        return torch.cat(ids).flatten()
+        ctx, pe = get_global_ctx(), self.ple_embedding
+        m = ctx.batch.attn_metadata
+        return ops.ngram_ids(
+            ctx.batch.input_ids,
+            ctx.kv_cache.ple_history[self.layer_id],
+            pe.layer_multipliers,
+            pe.ngram_heads_vocab_sizes,
+            pe.ngram_heads_offsets,
+            pe.heads,
+            self.config.eos_token_id,
+            m.slots,
+            m.valid,
+            cu_seqlens=m.cu_seqlens if ctx.batch.is_prefill else None,
+            max_extend_len=max((b - a for _, _, _, a, b in m.spans), default=0),
+        ).flatten()
 
     def start_prefetch(self):
         if self._prefetch_stream is None:
@@ -686,14 +575,14 @@ class PLE(BaseOP):
         # backend shares its workspace with attention and MoE.
         return table.reduce_embeddings(output)
 
-    def _forward_eager(self, residual):
+    def forward_prefill(self, residual):
         ctx, cfg = get_global_ctx(), self.config
         c = cfg
         embeddings = self.consume_embeddings().view(residual.shape[0], -1)
         h, n, eps = cfg.hidden_size, c.hc_count, cfg.rms_norm_eps
 
         norm = rms_norm
-        if self.execution.aligned and self.execution.use_optimized_kernels(residual):
+        if self.execution.aligned:
             from minisgl.kernel.qwen4_ops import grouped_norm
 
             def norm(x, w, eps, h):
@@ -724,8 +613,8 @@ class PLE(BaseOP):
 
     def forward(self, residual):
         ctx = get_global_ctx()
-        if not self.execution.use_optimized_kernels(residual) or ctx.batch.is_prefill:
-            return self._forward_eager(residual)
+        if ctx.batch.is_prefill:
+            return self.forward_prefill(residual)
         cfg = self.config
         c, m = cfg, ctx.batch.attn_metadata
         emb = self.consume_embeddings().view(residual.shape[0], -1)

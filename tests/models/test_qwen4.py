@@ -12,8 +12,8 @@ import torch
 import torch.nn.functional as F
 from minisgl.models.config import ModelConfig, RotaryConfig
 from minisgl.models.qwen4_config import Qwen4Config
-from minisgl.models.qwen4_ops import causal_conv, l2_norm, ngram_ids, rms_norm, rotary
 from minisgl.utils.hf import cached_load_hf_config
+from qwen4_oracle import causal_conv, l2_norm, ngram_ids, rms_norm, rotary
 from qwen4_test_utils import make_qwen4_config, qwen4_execution
 
 
@@ -25,9 +25,12 @@ def independent_hf_reference():
     """
     source = os.environ.get("QWEN4_HF_SOURCE")
     if not source or not Path(source).is_file():
-        raise unittest.SkipTest(
-            "Set QWEN4_HF_SOURCE to the independent Transformers implementation"
+        error = (
+            RuntimeError
+            if os.environ.get("QWEN4_REQUIRE_EXTERNAL_REFERENCE") == "1"
+            else unittest.SkipTest
         )
+        raise error("Set QWEN4_HF_SOURCE to the independent Transformers implementation")
     path = Path(source)
     names = {
         "l2norm",
@@ -83,7 +86,7 @@ class Qwen4OpsTest(unittest.TestCase):
                 )
                 with (
                     patch("minisgl.engine.engine.logger"),
-                    qwen4_execution(reference=True) as execution,
+                    qwen4_execution() as execution,
                 ):
                     _adjust_config(config, execution)
                 self.assertEqual(config.qwen4_stable_numerics, expected)
@@ -159,6 +162,7 @@ class Qwen4OpsTest(unittest.TestCase):
         self.assertGreater(recurrent_bytes(c, 1, 1, torch.bfloat16), 108 * 2**20)
         self.assertLess(recurrent_bytes(c, 1, 2, torch.bfloat16), 56 * 2**20)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_norm_and_gr_against_hf(self):
         from minisgl.models.qwen4 import GatedResidual
 
@@ -170,17 +174,17 @@ class Qwen4OpsTest(unittest.TestCase):
             hc_lowrank=8,
             rms_norm_eps=1e-6,
         )
-        with qwen4_execution(reference=True):
+        with qwen4_execution():
             mine = GatedResidual(cfg)
-        golden = ref["Qwen4ExpTextGatedResidual"](cfg)
+        golden = ref["Qwen4ExpTextGatedResidual"](cfg).cuda()
         for name, value in golden.state_dict().items():
             value.normal_(0, 0.1)
         mine.load_state_dict(dict(golden.state_dict()))
-        x = torch.randn(7, 128)
+        x = torch.randn(7, 128, device="cuda")
         expected, residual, injection = golden(x)
         actual, gate = mine.forward(x)
         torch.testing.assert_close(actual, expected)
-        torch.testing.assert_close(gate, injection)
+        # Production retains normalized residuals, not the materialized injection.
         torch.testing.assert_close(
             mine.combine(x, actual, gate),
             (residual.view(7, 4, 32) + injection[..., None] * expected[:, None]).flatten(1),
@@ -213,6 +217,32 @@ class Qwen4OpsTest(unittest.TestCase):
             for chunk in ids.split([1, 3, 2, 3])
         ]
         torch.testing.assert_close(torch.cat(chunks), actual)
+        if torch.cuda.is_available():
+            from minisgl.kernel.qwen4_ops import ngram_ids as production_hash
+
+            history = torch.full((1, 2), eos, device="cuda")
+            kwargs = {
+                "multipliers": multipliers.cuda(),
+                "sizes": sizes.cuda(),
+                "offsets": offsets.cuda(),
+                "heads": 2,
+                "eos": eos,
+                "slots": torch.tensor([0], device="cuda", dtype=torch.int32),
+                "valid": torch.tensor([True], device="cuda"),
+            }
+            full = production_hash(
+                ids.cuda(),
+                history,
+                **kwargs,
+                cu_seqlens=torch.tensor([0, ids.numel()], device="cuda", dtype=torch.int32),
+                max_extend_len=ids.numel(),
+            )
+            torch.testing.assert_close(full.cpu(), expected, atol=0, rtol=0)
+            history.fill_(eos)
+            decoded = torch.cat(
+                [production_hash(token.reshape(1).cuda(), history, **kwargs) for token in ids]
+            )
+            torch.testing.assert_close(decoded.cpu(), expected, atol=0, rtol=0)
 
     def test_conv_arbitrary_chunks(self):
         torch.manual_seed(4)
