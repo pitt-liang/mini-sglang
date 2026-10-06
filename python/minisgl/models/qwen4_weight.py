@@ -153,9 +153,9 @@ def pack_qwen4_weights(model: Qwen4ExpForCausalLM) -> None:
     """One allocation per merged projection; original parameter names stay views.
 
     Called after checkpoint validation, before graph capture. No permanent copy
-    of the original matrices is retained, and reference forward stays available.
+    of the original matrices is retained; the projection layout is fixed.
     """
-    if model.execution.aligned and torch.cuda.get_device_capability()[0] == 10:
+    if torch.cuda.get_device_capability()[0] == 10:
         from minisgl.kernel._qwen4_cute.hc_mix import permute_pad_up_weight
 
         groups = [model.model.hyper_connection_mixer]
@@ -165,17 +165,13 @@ def pack_qwen4_weights(model: Qwen4ExpForCausalLM) -> None:
             gr._sg_up = permute_pad_up_weight(gr.input_mix_weight_up.weight, gr.n)
     for layer in model.model.layers.op_list:
         attn = layer.linear_attn or layer.self_attn
-        if model.execution.aligned and layer.self_attn is not None:
+        if layer.self_attn is not None:
             rc = attn.config.rotary_config
             attn._rope_cache = ops.rope_cache(
                 attn.q_norm.weight.device, rc.rotary_dim, rc.base, rc.max_position
             )
         projections = (
-            (
-                [attn.in_proj_qkv, attn.in_proj_z, attn.in_proj_b, attn.in_proj_a]
-                if model.execution.aligned
-                else [attn.in_proj_qkv, attn.in_proj_z, attn.in_proj_a, attn.in_proj_b]
-            )
+            [attn.in_proj_qkv, attn.in_proj_z, attn.in_proj_b, attn.in_proj_a]
             if layer.linear_attn is not None
             else [attn.q_proj, attn.k_proj, attn.v_proj, attn.indexer.index_qk_proj]
         )

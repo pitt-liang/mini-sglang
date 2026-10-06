@@ -171,7 +171,7 @@ def main():
                 "rank": rank,
                 "runtime": {
                     key: getattr(engine.model.execution, key)
-                    for key in ("aligned", "ple_storage", "ple_prefetch")
+                    for key in ("ple_storage", "ple_prefetch")
                 },
                 "ple_tables": [
                     {

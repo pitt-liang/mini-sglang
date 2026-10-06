@@ -1,9 +1,7 @@
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
-from minisgl.core import get_global_ctx, get_qwen4_execution
-from minisgl.kernel.qwen4_ops import rms_norm, rotary
+from minisgl.core import get_global_ctx
 from minisgl.models.qwen4_config import Qwen4Config
 
 from .base import BaseAttnBackend, BaseAttnMetadata
@@ -30,11 +28,10 @@ class Qwen4Backend(BaseAttnBackend):
         if not isinstance(config, Qwen4Config):
             raise TypeError("Qwen4 attention requires Qwen4Config")
         self.config: Qwen4Config = config
-        self.execution = get_qwen4_execution()
 
         from minisgl.kernel.qwen4_qsa import SparseDecode
 
-        self.aligned_decode = SparseDecode()
+        self.sparse_decode = SparseDecode()
 
     def prepare_metadata(self, batch):
         spans, offset = [], 0
@@ -105,7 +102,6 @@ class Qwen4Backend(BaseAttnBackend):
         from minisgl.kernel.qwen4_qsa import (
             compress_decode,
             index_scores_decode,
-            select_decode,
             sparse_gqa,
             store_decode,
         )
@@ -113,11 +109,9 @@ class Qwen4Backend(BaseAttnBackend):
         ctx, c = get_global_ctx(), self.config
         batch, pool, table = ctx.batch, ctx.kv_cache, ctx.page_table
         m, rc = batch.attn_metadata, self.config.rotary_config
-        rope_cache = None
-        if self.execution.aligned:
-            from minisgl.kernel import qwen4_ops as aligned
+        from minisgl.kernel import qwen4_ops as ops
 
-            rope_cache = aligned.rope_cache(q.device, rc.rotary_dim, rc.base, rc.max_position)
+        rope_cache = ops.rope_cache(q.device, rc.rotary_dim, rc.base, rc.max_position)
         ratio, budget = c.indexer_compress_ratio, c.indexer_budget
         li = pool.layer_map[layer_id]
         kc, vc = pool.k_cache(layer_id).flatten(0, 1), pool.v_cache(layer_id).flatten(0, 1)
@@ -138,39 +132,17 @@ class Qwen4Backend(BaseAttnBackend):
                 self.config.rms_norm_eps,
                 rope_cache=rope_cache,
             )
-            if self.execution.aligned:
-                scores = index_scores_decode(
-                    iq, pool.index_keys[li], table, m.slots, m.lengths, m.valid, ratio, budget
-                )
-                nb = m.lengths // ratio
-                chosen = aligned.index_topk(
-                    scores,
-                    torch.where(m.valid, nb, 0),
-                    stable=getattr(pool, "stable_numerics", False),
-                )
-                indices = self.expand(chosen, nb, m.lengths, m.valid, ratio)
-                return self.aligned_decode(q, kc, vc, indices, table, m.slots)
-            if table.shape[1] // ratio <= 2048 and not self.execution.aligned:
-                indices = select_decode(
-                    iq, pool.index_keys[li], table, m.slots, m.lengths, m.valid, ratio, budget
-                )
-                return sparse_gqa(q, kc, vc, indices, table, m.slots, decode=True)
-            blocks = torch.arange(table.shape[1] // ratio, device=q.device)
-            loc = table[m.slots.long()[:, None], blocks[None, :] * ratio].long() // ratio
-            keys = pool.index_keys[li, loc].float()
+            scores = index_scores_decode(
+                iq, pool.index_keys[li], table, m.slots, m.lengths, m.valid, ratio, budget
+            )
             nb = m.lengths // ratio
-            visible = (blocks[None, :] < nb[:, None]) & m.valid[:, None]
-            keys = torch.where(visible[:, :, None], keys, 0.0)
-            scores = torch.matmul(iq.float(), keys.transpose(1, 2)).relu().sum(1)
-            scores = scores.masked_fill(~visible, -float("inf"))
-            chosen = scores.topk(min(budget // ratio, blocks.numel()), dim=-1).indices
-            chosen = torch.where(
-                nb[:, None] <= chosen.shape[1],
-                torch.arange(chosen.shape[1], device=q.device)[None, :],
-                chosen,
+            chosen = ops.index_topk(
+                scores,
+                torch.where(m.valid, nb, 0),
+                stable=getattr(pool, "stable_numerics", False),
             )
             indices = self.expand(chosen, nb, m.lengths, m.valid, ratio)
-            return sparse_gqa(q, kc, vc, indices, table, m.slots, decode=True)
+            return self.sparse_decode(q, kc, vc, indices, table, m.slots)
         pool.store_kv(k, v, batch.out_loc, layer_id)
         out = torch.empty_like(q)
         for slot, cached, end, a, b in m.spans:
@@ -184,48 +156,17 @@ class Qwen4Backend(BaseAttnBackend):
                 starts = torch.arange(
                     cached - past, cached - past + complete * ratio, ratio, device=q.device
                 )
-                if self.execution.aligned:
-                    pooled = aligned.index_norm_rope(
-                        pooled[:, None], index_norm, starts, rope_cache, self.config.rms_norm_eps
-                    )[:, 0]
-                else:
-                    pooled = rotary(
-                        rms_norm(pooled, index_norm, self.config.rms_norm_eps)[:, None],
-                        starts,
-                        rc.rotary_dim,
-                        rc.base,
-                    )[:, 0]
+                pooled = ops.index_norm_rope(
+                    pooled[:, None], index_norm, starts, rope_cache, self.config.rms_norm_eps
+                )[:, 0]
                 pool.index_keys[li, table[slot, starts].long() // ratio] = pooled
             tail = raw[complete * ratio :]
             pool.pending[li, slot, : tail.shape[0]].copy_(tail)
-            # Before the sparse budget is reached QSA is exactly dense causal
-            # attention. Keep the legacy SDPA path for its numerical contract
-            # and efficient multi-query prefill tiles.
-            dense_count = max(0, min(b - a, budget - cached))
-            if self.execution.aligned:
-                dense_count = 0
-            if dense_count:
-                dense_end = cached + dense_count
-                loc = table[slot, :dense_end].long()
-                mask = (
-                    torch.arange(dense_end, device=q.device)[None, :]
-                    <= torch.arange(cached, dense_end, device=q.device)[:, None]
-                )
-                dense = F.scaled_dot_product_attention(
-                    q[a : a + dense_count].transpose(0, 1)[None],
-                    kc[loc].transpose(0, 1)[None],
-                    vc[loc].transpose(0, 1)[None],
-                    attn_mask=mask[None, None],
-                    enable_gqa=True,
-                )
-                out[a : a + dense_count] = dense[0].transpose(0, 1)
-            if dense_count == b - a:
-                continue
             nb = end // ratio
             blocks = torch.arange(nb, device=q.device)
             keys = pool.index_keys[li, table[slot, blocks * ratio].long() // ratio].float()
             chunk = max(1, min(1024, 2**22 // max(1, nb * iq.shape[1])))
-            for start in range(a + dense_count, b, chunk):
+            for start in range(a, b, chunk):
                 stop = min(start + chunk, b)
                 lengths = torch.arange(
                     cached + start - a + 1, cached + stop - a + 1, device=q.device
@@ -234,20 +175,12 @@ class Qwen4Backend(BaseAttnBackend):
                 if nb:
                     scores = (iq[start:stop].float() @ keys.T).relu().sum(1)
                     scores = scores.masked_fill(blocks[None, :] >= counts[:, None], -float("inf"))
-                    if self.execution.aligned:
-                        scores = scores / (iq.shape[-1] ** 0.5)
-                        chosen = aligned.index_topk(
-                            scores.contiguous(),
-                            counts,
-                            stable=getattr(pool, "stable_numerics", False),
-                        )
-                    else:
-                        chosen = scores.topk(min(budget // ratio, nb), dim=-1).indices
-                        chosen = torch.where(
-                            counts[:, None] <= chosen.shape[1],
-                            torch.arange(chosen.shape[1], device=q.device)[None, :],
-                            chosen,
-                        )
+                    scores = scores / (iq.shape[-1] ** 0.5)
+                    chosen = ops.index_topk(
+                        scores.contiguous(),
+                        counts,
+                        stable=getattr(pool, "stable_numerics", False),
+                    )
                 else:
                     chosen = torch.empty((stop - start, 0), device=q.device, dtype=torch.int64)
                 indices = self.expand(chosen, counts, lengths, None, ratio)
@@ -259,23 +192,12 @@ class Qwen4Backend(BaseAttnBackend):
                     indices,
                     table,
                     slots,
-                    sglang_prefill_rows=q.shape[0] if self.execution.aligned else None,
+                    prefill_rows=q.shape[0],
                     stable_prefill=getattr(pool, "stable_numerics", False),
                 )
         return out
 
     def expand(self, chosen, counts, lengths, valid, ratio):
-        if self.execution.aligned:
-            from minisgl.kernel.qwen4_qsa import expand_compact
+        from minisgl.kernel.qwen4_qsa import expand_compact
 
-            return expand_compact(chosen, counts, lengths, valid, ratio)
-        selected = chosen[:, :, None] * ratio + torch.arange(ratio, device=chosen.device)
-        selected = torch.where(
-            (chosen[:, :, None] >= 0) & (chosen[:, :, None] < counts[:, None, None]), selected, -1
-        ).flatten(1)
-        tail = counts[:, None] * ratio + torch.arange(ratio - 1, device=chosen.device)
-        tail = torch.where(tail < lengths[:, None], tail, -1)
-        indices = torch.cat((selected, tail), dim=1).to(torch.int32)
-        if valid is not None:
-            indices = torch.where(valid[:, None], indices, -1)
-        return indices.contiguous()
+        return expand_compact(chosen, counts, lengths, valid, ratio)

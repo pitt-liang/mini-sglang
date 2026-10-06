@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen4 production primitives and explicit legacy fallbacks.
+"""Qwen4 production primitives.
 
-Unprefixed primitives implement the aligned numerical contract or are shared by
-both paths. legacy_* primitives retain the earlier BF16 numerical contract.
+The numerical contract follows the selected SGLang production operators.
 SGLang-derived operator provenance is in _qwen4_fla/README.md.
 """
 
@@ -12,28 +11,10 @@ import torch
 import torch.nn.functional as F
 import triton as tr
 import triton.language as tl
-from triton.language.extra.cuda import libdevice
 
 from .utils import load_jit
 
-
 # Shared production helpers (Torch where a fused replacement is not yet available).
-def rms_norm(x, weight, eps=1e-6, group_size=None):
-    shape = x.shape
-    y = x.float().reshape(*shape[:-1], -1, group_size or shape[-1])
-    y = y * torch.rsqrt(y.square().mean(-1, keepdim=True) + eps)
-    return (y.reshape(shape) * (1 + weight.float())).to(x.dtype)
-
-
-def rotary(x, positions, rotary_dim, base):
-    freq = base ** (-torch.arange(0, rotary_dim, 2, device=x.device).float() / rotary_dim)
-    angle = positions.float()[:, None] * freq[None, :]
-    angle = torch.cat((angle, angle), dim=-1)[:, None, :]
-    cos, sin = angle.cos().to(x.dtype), angle.sin().to(x.dtype)
-    a = x[..., :rotary_dim]
-    half = rotary_dim // 2
-    rotated = a * cos + torch.cat((-a[..., half:], a[..., :half]), -1) * sin
-    return torch.cat((rotated, x[..., rotary_dim:]), -1)
 
 
 def causal_conv(x, weight, history, dilation=1):
@@ -45,7 +26,7 @@ def causal_conv(x, weight, history, dilation=1):
     return F.silu(out[0].T)
 
 
-# Shared helpers and legacy BF16 primitives.
+# PLE host/device lookup.
 def validate_ple_host_device(device):
     """Fail before allocating a large pinned table on an unsupported device."""
     from cuda.bindings import runtime
@@ -118,40 +99,6 @@ def ple_lookup(pointer, ids, out, start, rows):
 
 
 @tr.jit
-def _legacy_gdn_gates(
-    A, B, LOG, DT, G, BETA, H: tl.constexpr, STRIDE: tl.constexpr, N: tl.constexpr
-):
-    row = tl.program_id(0)
-    j = tl.arange(0, N)
-    a = tl.load(A + row * STRIDE + j, j < H, 0).to(tl.float32)
-    b = tl.load(B + row * STRIDE + j, j < H, 0).to(tl.float32)
-    log = tl.load(LOG + j, j < H, 0).to(tl.float32)
-    dt = tl.load(DT + j, j < H, 0).to(tl.float32)
-    x = a + dt
-    softplus = tl.where(x > 20.0, x, libdevice.log1p(libdevice.exp(x)))
-    tl.store(G + row * H + j, -libdevice.exp(log) * softplus, j < H)
-    tl.store(BETA + row * H + j, 1.0 / (1.0 + libdevice.exp(-b)), j < H)
-
-
-def legacy_gdn_gates(a, b, log_a, dt):
-    decay = torch.empty(a.shape, device=a.device, dtype=torch.float32)
-    beta = torch.empty(a.shape, device=a.device, dtype=a.dtype)
-    _legacy_gdn_gates[(a.shape[0],)](
-        a,
-        b,
-        log_a,
-        dt,
-        decay,
-        beta,
-        a.shape[1],
-        a.stride(0),
-        tr.next_power_of_2(a.shape[1]),
-        enable_fp_fusion=False,
-    )
-    return decay, beta
-
-
-@tr.jit
 def _gr_down(X, W, P, M: tl.constexpr, K: tl.constexpr, R: tl.constexpr, SK: tl.constexpr):
     n, split = tl.program_id(0), tl.program_id(1)
     m = tl.arange(0, 16)
@@ -166,364 +113,6 @@ def _gr_down(X, W, P, M: tl.constexpr, K: tl.constexpr, R: tl.constexpr, SK: tl.
     tl.store(
         P + (split * M + m[:, None]) * R + r[None, :], acc, (m[:, None] < M) & (r[None, :] < R)
     )
-
-
-@tr.jit
-def _legacy_gr_down_finish(
-    P, T, M: tl.constexpr, R: tl.constexpr, SK: tl.constexpr, HC: tl.constexpr, N: tl.constexpr
-):
-    row = tl.program_id(0)
-    r = tl.arange(0, N)
-    s = tl.arange(0, SK)
-    partial = tl.load(P + (s[:, None] * M + row) * R + r[None, :], r[None, :] < R, 0)
-    raw = tl.sum(partial, 0).to(T.dtype.element_ty).to(tl.float32)
-    raw = (raw / HC).to(T.dtype.element_ty).to(tl.float32)
-    tl.store(T + row * R + r, raw * tl.sigmoid(raw), r < R)
-
-
-@tr.jit
-def _legacy_gr_up_mix(
-    T, W, X, O, M: tl.constexpr, H: tl.constexpr, R: tl.constexpr, HC: tl.constexpr
-):
-    j = tl.program_id(0) * 16 + tl.arange(0, 16)
-    m = tl.arange(0, 16)
-    rr = tl.arange(0, 64)
-    branch = tl.arange(0, HC)
-    col = tl.reshape(branch[:, None] * H + j[None, :], (HC * 16,))
-    mask_col = tl.reshape(tl.broadcast_to(j[None, :] < H, (HC, 16)), (HC * 16,))
-    acc = tl.zeros((16, HC * 16), tl.float32)
-    for start in range(tr.cdiv(R, 64)):
-        r = start * 64 + rr
-        t = tl.load(T + m[:, None] * R + r[None, :], (m[:, None] < M) & (r[None, :] < R), 0)
-        w = tl.load(W + col[None, :] * R + r[:, None], mask_col[None, :] & (r[:, None] < R), 0)
-        acc = tl.dot(t, w, acc)
-    acc = acc.to(X.dtype.element_ty).to(tl.float32)
-    gate = tl.sigmoid(acc).to(X.dtype.element_ty).to(tl.float32)
-    x = tl.load(X + m[:, None] * HC * H + col[None, :], (m[:, None] < M) & mask_col[None, :], 0).to(
-        tl.float32
-    )
-    product = (gate * x).to(X.dtype.element_ty).to(tl.float32)
-    total = tl.sum(tl.reshape(product, (16, HC, 16)), 1)
-    tl.store(O + m[:, None] * H + j[None, :], total / HC, (m[:, None] < M) & (j[None, :] < H))
-
-
-def legacy_gr_project_mix(x, down, up, hc):
-    m, k = x.shape
-    r, h, sk = down.shape[0], k // hc, 16
-    partial = torch.empty((sk, m, r), device=x.device, dtype=torch.float32)
-    middle = torch.empty((m, r), device=x.device, dtype=x.dtype)
-    out = torch.empty((m, h), device=x.device, dtype=x.dtype)
-    _gr_down[(tr.cdiv(r, 32), sk)](x, down, partial, m, k, r, sk, num_warps=4)
-    _legacy_gr_down_finish[(m,)](
-        partial, middle, m, r, sk, hc, tr.next_power_of_2(r), enable_fp_fusion=False
-    )
-    _legacy_gr_up_mix[(tr.cdiv(h, 16),)](
-        middle, up, x, out, m, h, r, hc, num_warps=4, enable_fp_fusion=False
-    )
-    return out
-
-
-@tr.jit
-def _legacy_shared_act(X, GU, W, ACT, GATE, H: tl.constexpr, I: tl.constexpr, N: tl.constexpr):
-    row = tl.program_id(0)
-    j = tl.arange(0, N)
-    x = tl.load(X + row * H + j, j < H, 0).to(tl.float32)
-    w = tl.load(W + j, j < H, 0).to(tl.float32)
-    dot = tl.sum(x * w, 0).to(X.dtype.element_ty).to(tl.float32)
-    tl.store(GATE + row, tl.sigmoid(dot))
-    g = tl.load(GU + row * 2 * I + j, j < I, 0).to(tl.float32)
-    u = tl.load(GU + row * 2 * I + I + j, j < I, 0).to(tl.float32)
-    a = (g * tl.sigmoid(g)).to(X.dtype.element_ty).to(tl.float32)
-    tl.store(ACT + row * I + j, a * u, j < I)
-
-
-def legacy_shared_activation(x, gate_up, gate_weight):
-    i = gate_up.shape[-1] // 2
-    act = torch.empty((x.shape[0], i), device=x.device, dtype=x.dtype)
-    gate = torch.empty((x.shape[0], 1), device=x.device, dtype=x.dtype)
-    _legacy_shared_act[(x.shape[0],)](
-        x,
-        gate_up,
-        gate_weight,
-        act,
-        gate,
-        x.shape[-1],
-        i,
-        tr.next_power_of_2(max(x.shape[-1], i)),
-        enable_fp_fusion=False,
-    )
-    return act, gate
-
-
-@tr.jit
-def _legacy_moe_combine(P, G, O, H: tl.constexpr, SIZE: tl.constexpr, N: tl.constexpr):
-    j = tl.program_id(0) * N + tl.arange(0, N)
-    row, col = j // H, j % H
-    routed = tl.load(P + row * 2 * H + col, j < SIZE, 0).to(tl.float32)
-    shared = tl.load(P + row * 2 * H + H + col, j < SIZE, 0).to(tl.float32)
-    gate = tl.load(G + row, j < SIZE, 0).to(tl.float32)
-    y = (shared * gate).to(P.dtype.element_ty).to(tl.float32)
-    tl.store(O + j, routed + y, j < SIZE)
-
-
-def legacy_moe_combine(packed, gate):
-    out = torch.empty(
-        (packed.shape[0], packed.shape[1] // 2), device=packed.device, dtype=packed.dtype
-    )
-    _legacy_moe_combine[(tr.cdiv(out.numel(), 256),)](
-        packed, gate, out, out.shape[1], out.numel(), 256, enable_fp_fusion=False
-    )
-    return out
-
-
-@tr.jit
-def _legacy_norm(
-    X,
-    W,
-    Y,
-    POS,
-    D: tl.constexpr,
-    STRIDE: tl.constexpr,
-    HEADS: tl.constexpr,
-    RD: tl.constexpr,
-    BASE: tl.constexpr,
-    EPS: tl.constexpr,
-    GROUPS: tl.constexpr,
-    ZERO: tl.constexpr,
-    N: tl.constexpr,
-):
-    row = tl.program_id(0)
-    j = tl.arange(0, N)
-    x = tl.load(X + row * STRIDE + j, j < D, 0).to(tl.float32)
-    w = tl.load(W + (row % GROUPS) * D + j, j < D, 0).to(tl.float32)
-    scale = tl.rsqrt(tl.sum(x * x, 0) / D + EPS)
-    y = (x * scale * (w + (1.0 if ZERO else 0.0))).to(Y.dtype.element_ty)
-    if RD > 0:
-        peer = tl.where(j < RD // 2, j + RD // 2, j - RD // 2)
-        px = tl.load(X + row * STRIDE + peer, j < RD, 0).to(tl.float32)
-        pw = tl.load(W + (row % GROUPS) * D + peer, j < RD, 0).to(tl.float32)
-        py = (px * scale * (pw + (1.0 if ZERO else 0.0))).to(Y.dtype.element_ty)
-        pos = tl.load(POS + row // HEADS).to(tl.float32)
-        angle = pos * tl.exp(-tl.log(BASE) * (2.0 * (j % (RD // 2)) / RD))
-        co = tl.cos(angle).to(Y.dtype.element_ty).to(tl.float32)
-        si = tl.sin(angle).to(Y.dtype.element_ty).to(tl.float32)
-        a = (y.to(tl.float32) * co).to(Y.dtype.element_ty).to(tl.float32)
-        b = (
-            (py.to(tl.float32) * tl.where(j < RD // 2, -si, si))
-            .to(Y.dtype.element_ty)
-            .to(tl.float32)
-        )
-        y = tl.where(j < RD, a + b, y.to(tl.float32)).to(Y.dtype.element_ty)
-    tl.store(Y + row * D + j, y, j < D)
-
-
-def legacy_norm(x, weight, eps=1e-6, group_size=None, positions=None, rotary_dim=0, base=10000.0):
-    d = group_size or x.shape[-1]
-    flat = x.reshape(-1, d)
-    out = torch.empty(flat.shape, device=x.device, dtype=x.dtype)
-    groups = weight.numel() // d
-    heads = x.shape[-2] if x.ndim == 3 else 1
-    _legacy_norm[(flat.shape[0],)](
-        flat,
-        weight,
-        out,
-        positions,
-        d,
-        flat.stride(0),
-        heads,
-        rotary_dim,
-        float(base),
-        eps,
-        groups,
-        True,
-        tr.next_power_of_2(d),
-        enable_fp_fusion=False,
-    )
-    return out.view(x.shape)
-
-
-@tr.jit
-def _legacy_silu_div(X, Y, SIZE: tl.constexpr, DIV: tl.constexpr, N: tl.constexpr):
-    j = tl.program_id(0) * N + tl.arange(0, N)
-    x = (tl.load(X + j, j < SIZE, 0).to(tl.float32) / DIV).to(X.dtype.element_ty).to(tl.float32)
-    tl.store(Y + j, x * tl.sigmoid(x), j < SIZE)
-
-
-def legacy_silu_div(x, divisor):
-    out = torch.empty_like(x)
-    _legacy_silu_div[(tr.cdiv(x.numel(), 256),)](x, out, x.numel(), divisor, 256)
-    return out
-
-
-@tr.jit
-def _legacy_mix(G, X, O, H: tl.constexpr, HC: tl.constexpr, N: tl.constexpr):
-    row = tl.program_id(0)
-    j = tl.arange(0, N)
-    acc = tl.full((N,), 0.0, tl.float32)
-    for h in range(HC):
-        off = (row * HC + h) * H + j
-        g = tl.sigmoid(tl.load(G + off, j < H, 0).to(tl.float32)).to(X.dtype.element_ty)
-        x = tl.load(X + off, j < H, 0)
-        acc += (g.to(tl.float32) * x.to(tl.float32)).to(X.dtype.element_ty).to(tl.float32)
-    tl.store(O + row * H + j, acc / HC, j < H)
-
-
-def legacy_gr_mix(gates, normed, hc):
-    h = normed.shape[-1] // hc
-    out = torch.empty((normed.shape[0], h), device=normed.device, dtype=normed.dtype)
-    _legacy_mix[(out.shape[0],)](gates, normed, out, h, hc, tr.next_power_of_2(h))
-    return out
-
-
-@tr.jit
-def _legacy_combine(
-    R, X, NORM, W, O, H: tl.constexpr, HC: tl.constexpr, NW: tl.constexpr, NH: tl.constexpr
-):
-    row, branch = tl.program_id(0), tl.program_id(1)
-    j = tl.arange(0, NW)
-    v = tl.load(NORM + row * H * HC + j, j < H * HC, 0).to(tl.float32)
-    w = tl.load(W + branch * H * HC + j, j < H * HC, 0).to(tl.float32)
-    dot = tl.sum(v * w, 0).to(R.dtype.element_ty).to(tl.float32)
-    dot = (dot / HC).to(R.dtype.element_ty).to(tl.float32)
-    gate = (2.0 * tl.sigmoid(dot).to(R.dtype.element_ty).to(tl.float32)).to(R.dtype.element_ty)
-    k = tl.arange(0, NH)
-    off = (row * HC + branch) * H + k
-    r = tl.load(R + off, k < H, 0).to(tl.float32)
-    x = tl.load(X + row * H + k, k < H, 0).to(tl.float32)
-    inject = (gate.to(tl.float32) * x).to(R.dtype.element_ty).to(tl.float32)
-    tl.store(O + off, r + inject, k < H)
-
-
-def legacy_gr_combine(residual, output, normed, weight):
-    hc, h = weight.shape[0], output.shape[-1]
-    out = torch.empty_like(residual)
-    _legacy_combine[(out.shape[0], hc)](
-        residual,
-        output,
-        normed,
-        weight,
-        out,
-        h,
-        hc,
-        tr.next_power_of_2(h * hc),
-        tr.next_power_of_2(h),
-        num_warps=8,
-        enable_fp_fusion=False,
-    )
-    return out
-
-
-@tr.jit
-def _legacy_conv(
-    X,
-    W,
-    S,
-    SLOTS,
-    VALID,
-    O,
-    C: tl.constexpr,
-    K: tl.constexpr,
-    DIL: tl.constexpr,
-    NH: tl.constexpr,
-    NC: tl.constexpr,
-):
-    row = tl.program_id(0)
-    if tl.load(VALID + row):
-        slot = tl.load(SLOTS + row)
-        c = tl.program_id(1) * NC + tl.arange(0, NC)
-        hs = tl.arange(0, NH)
-        hist = tl.load(
-            S + (slot * C + c[:, None]) * ((K - 1) * DIL) + hs[None, :],
-            (c[:, None] < C) & (hs[None, :] < (K - 1) * DIL),
-            0,
-        )
-        x = tl.load(X + row * C + c, c < C, 0).to(tl.float32)
-        acc = x * tl.load(W + c * K + K - 1, c < C, 0).to(tl.float32)
-        for i in range(K - 1):
-            old = tl.sum(tl.where(hs[None, :] == i * DIL, hist.to(tl.float32), 0.0), 1)
-            acc += old * tl.load(W + c * K + i, c < C, 0).to(tl.float32)
-        acc = acc.to(X.dtype.element_ty).to(tl.float32)
-        tl.store(O + row * C + c, acc * tl.sigmoid(acc), c < C)
-        shifted = tl.load(
-            S + (slot * C + c[:, None]) * ((K - 1) * DIL) + hs[None, :] + 1,
-            (c[:, None] < C) & (hs[None, :] < (K - 1) * DIL - 1),
-            0,
-        )
-        shifted = tl.where(hs[None, :] == (K - 1) * DIL - 1, x[:, None], shifted.to(tl.float32))
-        tl.store(
-            S + (slot * C + c[:, None]) * ((K - 1) * DIL) + hs[None, :],
-            shifted,
-            (c[:, None] < C) & (hs[None, :] < (K - 1) * DIL),
-        )
-    else:
-        c = tl.program_id(1) * NC + tl.arange(0, NC)
-        tl.store(O + row * C + c, 0.0, c < C)
-
-
-def legacy_conv_decode(x, weight, state, slots, valid, dilation=1):
-    out = torch.empty_like(x)
-    k = weight.shape[-1]
-    _legacy_conv[(x.shape[0], tr.cdiv(x.shape[1], 64))](
-        x,
-        weight,
-        state,
-        slots,
-        valid,
-        out,
-        x.shape[1],
-        k,
-        dilation,
-        tr.next_power_of_2((k - 1) * dilation),
-        64,
-        enable_fp_fusion=False,
-    )
-    return out
-
-
-@tr.jit
-def _legacy_l2(X, O, D: tl.constexpr, SX: tl.constexpr, N: tl.constexpr):
-    row = tl.program_id(0)
-    j = tl.arange(0, N)
-    x = tl.load(X + row * SX + j, j < D, 0).to(tl.float32)
-    xx = (x * x).to(X.dtype.element_ty).to(tl.float32)
-    den = tl.sum(xx, 0).to(X.dtype.element_ty).to(tl.float32)
-    den = (den + 1e-6).to(X.dtype.element_ty).to(tl.float32)
-    inv = tl.rsqrt(den).to(X.dtype.element_ty).to(tl.float32)
-    tl.store(O + row * D + j, x * inv, j < D)
-
-
-def legacy_l2(x):
-    flat = x.reshape(-1, x.shape[-1])
-    out = torch.empty_like(flat)
-    _legacy_l2[(flat.shape[0],)](
-        flat,
-        out,
-        flat.shape[-1],
-        flat.stride(0),
-        tr.next_power_of_2(flat.shape[-1]),
-        enable_fp_fusion=False,
-    )
-    return out.view(x.shape)
-
-
-@tr.jit
-def _legacy_gdn_out(X, Z, W, O, D: tl.constexpr, EPS: tl.constexpr, N: tl.constexpr):
-    row = tl.program_id(0)
-    j = tl.arange(0, N)
-    x = tl.load(X + row * D + j, j < D, 0).to(tl.float32)
-    z = tl.load(Z + row * D + j, j < D, 0).to(tl.float32)
-    w = tl.load(W + j, j < D, 0).to(tl.float32)
-    y = (x * tl.rsqrt(tl.sum(x * x, 0) / D + EPS)).to(X.dtype.element_ty).to(tl.float32)
-    y = (y * w).to(X.dtype.element_ty).to(tl.float32)
-    tl.store(O + row * D + j, y * tl.sigmoid(z), j < D)
-
-
-def legacy_gdn_output(x, z, weight, eps):
-    out = torch.empty_like(x)
-    _legacy_gdn_out[(x.numel() // x.shape[-1],)](
-        x, z, weight, out, x.shape[-1], eps, tr.next_power_of_2(x.shape[-1]), enable_fp_fusion=False
-    )
-    return out
 
 
 @tr.jit
@@ -716,7 +305,7 @@ def ngram_ids(
     return out
 
 
-# Aligned production primitives.
+# Production primitives.
 @lru_cache(None)
 def rope_cache(device, rotary_dim, base, max_position):
     inv = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, device=device).float() / rotary_dim))
@@ -874,7 +463,7 @@ def _router(LOGITS, WEIGHTS, IDS, E: tl.constexpr, K: tl.constexpr, BK: tl.const
 
 def router(logits, top_k):
     if logits.shape[1] != 512 or not logits.is_contiguous():
-        raise ValueError("Qwen4 aligned router requires contiguous 512-expert logits")
+        raise ValueError("Qwen4 router requires contiguous 512-expert logits")
     weights = torch.empty((logits.shape[0], top_k), device=logits.device, dtype=torch.float32)
     ids = torch.empty_like(weights, dtype=torch.int32)
     _router[(logits.shape[0],)](
@@ -1001,8 +590,7 @@ def _ple_conv_state(X, S, SLOTS, VALID, O, C: tl.constexpr, L: tl.constexpr, N: 
 
 
 def ple_conv_decode(x, weight, state, slots, valid, dilation):
-    # Match SGLang's native depthwise Conv1D + SiLU. In particular, the
-    # legacy Triton decode's different sum/exp order can flip a BF16 ulp.
+    # Preserve SGLang's native depthwise Conv1D + SiLU rounding points.
     rows, channels = x.shape
     length = state.shape[-1]
     conv_input = torch.empty((rows, channels, length + 1), device=x.device, dtype=x.dtype)

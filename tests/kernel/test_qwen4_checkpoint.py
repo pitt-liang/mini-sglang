@@ -84,9 +84,7 @@ def test_qsa_prefill_is_invariant_to_prefix_removal():
     slots = torch.zeros(17, device="cuda", dtype=torch.int32)
     # A long prefill's last sparse tile and a hit's short suffix contain the
     # same queries/KV, but previously selected different online-softmax tiles.
-    baseline = sparse_gqa(
-        q, k, v, indices, table, slots, sglang_prefill_rows=2053, stable_prefill=True
-    )
+    baseline = sparse_gqa(q, k, v, indices, table, slots, prefill_rows=2053, stable_prefill=True)
     actual = sparse_gqa(
         q[-5:],
         k,
@@ -94,7 +92,7 @@ def test_qsa_prefill_is_invariant_to_prefix_removal():
         indices[-5:],
         table,
         slots[-5:],
-        sglang_prefill_rows=5,
+        prefill_rows=5,
         stable_prefill=True,
     )
     torch.testing.assert_close(actual, baseline[-5:], atol=0, rtol=0)

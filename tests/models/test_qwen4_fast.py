@@ -5,7 +5,6 @@ import unittest
 import qwen4_oracle as ref
 import torch
 from minisgl.kernel import qwen4_ops as fast
-from minisgl.kernel.qwen4 import gated_delta_decode, gated_delta_rule
 from qwen4_test_utils import make_qwen4_config, qwen4_execution
 
 
@@ -85,7 +84,7 @@ class FastTests(unittest.TestCase):
                     "minisgl.layers.embedding.get_tp_info",
                     return_value=SimpleNamespace(rank=0, size=1),
                 ),
-                qwen4_execution(aligned=True, ple_storage=storage, ple_prefetch=prefetch),
+                qwen4_execution(ple_storage=storage, ple_prefetch=prefetch),
             ):
                 ple = PLE(cfg, 1)
             for _, owner, attr, weight in _parameters(ple):
@@ -252,18 +251,21 @@ class FastTests(unittest.TestCase):
             w = self.tensor(d) * 0.1
             p = torch.tensor([0, 3, 2048, 8191, 131071], device="cuda")
             expected = ref.rotary(ref.rms_norm(x, w), p, rd, 10000000.0)
-            actual = fast.legacy_norm(x, w, positions=p, rotary_dim=rd, base=10000000)
+            actual = fast.norm_rope(x, w, p, fast.rope_cache(x.device, rd, 10000000.0, 131072))
             torch.testing.assert_close(actual, expected, atol=0.032, rtol=0.02)
         x = self.tensor(7, 10240)
         w = self.tensor(10240) * 0.1
         torch.testing.assert_close(
-            fast.legacy_norm(x, w, group_size=2560),
+            fast.grouped_norm(x, w, 2560),
             ref.rms_norm(x, w, group_size=2560),
             atol=0.016,
             rtol=0.01,
         )
 
     def test_gr(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
         from minisgl.models.qwen4 import GatedResidual
 
         cfg = make_qwen4_config(
@@ -284,7 +286,11 @@ class FastTests(unittest.TestCase):
         x, y = self.tensor(4, 10240), self.tensor(4, 2560)
         mixed, gate = ref.gated_residual(op, x)
         expected = (x.view(-1, op.n, op.h) + gate[..., None] * y[:, None]).flatten(1)
-        actual, norm = op.forward(x)
+        with patch(
+            "minisgl.models.qwen4.get_global_ctx",
+            return_value=SimpleNamespace(kv_cache=SimpleNamespace(stable_numerics=False)),
+        ):
+            actual, norm = op.forward(x)
         torch.testing.assert_close(actual, mixed, atol=0.008, rtol=0.02)
         torch.testing.assert_close(op.combine(x, y, norm), expected, atol=0.032, rtol=0.02)
 
@@ -324,6 +330,7 @@ class FastTests(unittest.TestCase):
                 64,
                 10000000,
                 1e-6,
+                rope_cache=fast.rope_cache(raw.device, 64, 10000000.0, 16),
             )
             torch.testing.assert_close(pending, expected_pending, atol=0, rtol=0)
             torch.testing.assert_close(cache, expected_cache, atol=0.016, rtol=0.01)
@@ -338,7 +345,7 @@ class FastTests(unittest.TestCase):
             ys = []
             for row, slot in enumerate([2, 0]):
                 ys.append(ref.causal_conv(x[row : row + 1], w, expected[slot], dil))
-            actual = fast.legacy_conv_decode(x, w, hist, slots, valid, dil)
+            actual = fast.ple_conv_decode(x, w, hist, slots, valid, dil)
             torch.testing.assert_close(actual[:2], torch.cat(ys), atol=0.063, rtol=0.02)
             torch.testing.assert_close(hist, expected, atol=0, rtol=0)
             self.assertEqual(actual[2:].count_nonzero().item(), 0)
@@ -417,7 +424,7 @@ class FastTests(unittest.TestCase):
 
     def test_sparse_decode(self):
         import torch.nn.functional as F
-        from minisgl.kernel.qwen4_qsa import sparse_gqa
+        from minisgl.kernel.qwen4_qsa import SparseDecode
 
         q, k, v = self.tensor(4, 12, 256), self.tensor(4096, 1, 256), self.tensor(4096, 1, 256)
         table = torch.randperm(4096, device="cuda").to(torch.int32).view(4, 1024)
@@ -425,7 +432,7 @@ class FastTests(unittest.TestCase):
         indices = torch.full((4, 515), -1, device="cuda", dtype=torch.int32)
         for row, count in enumerate([3, 128, 515]):
             indices[row, :count] = torch.randperm(1024, device="cuda")[:count]
-        actual = sparse_gqa(q, k, v, indices, table, slots, decode=True)
+        actual = SparseDecode()(q, k, v, indices, table, slots)
         for row, count in enumerate([3, 128, 515]):
             loc = table[slots[row], indices[row, :count]].long()
             expected = F.scaled_dot_product_attention(
@@ -438,14 +445,17 @@ class FastTests(unittest.TestCase):
         self.assertEqual(actual[3].count_nonzero().item(), 0)
 
     def test_decode_selector(self):
-        from minisgl.kernel.qwen4_qsa import select_decode
+        from minisgl.kernel.qwen4_qsa import expand_compact, index_scores_decode
 
         table = torch.arange(4 * 4096, device="cuda", dtype=torch.int32).view(4, 4096)
-        q, keys = self.tensor(4, 4, 128), self.tensor(4096, 128)
+        # Avoid equal zero scores: stock radix top-k does not define tie ordering.
+        q, keys = self.tensor(4, 4, 128).abs(), self.tensor(4096, 128).abs()
         slots = torch.tensor([1, 0, 2, 2], device="cuda", dtype=torch.int32)
         lengths = torch.tensor([130, 2053, 2049, 1], device="cuda", dtype=torch.int32)
         valid = torch.tensor([True, True, True, False], device="cuda")
-        actual = select_decode(q, keys, table, slots, lengths, valid, 4, 2048)
+        scores = index_scores_decode(q, keys, table, slots, lengths, valid, 4, 2048)
+        counts = torch.where(valid, lengths // 4, 0)
+        actual = expand_compact(fast.index_topk(scores, counts), counts, lengths, valid, 4)
         for row, (slot, length) in enumerate([(1, 130), (0, 2053), (2, 2049)]):
             nb = length // 4
             loc = table[slot, : nb * 4 : 4].long() // 4
@@ -465,22 +475,6 @@ class FastTests(unittest.TestCase):
             )
             self.assertTrue((actual[row, len(expected) :] == -1).all())
         self.assertTrue((actual[3] == -1).all())
-
-    def test_shared_activation(self):
-        import torch.nn.functional as F
-
-        x, gu, w = self.tensor(4, 2560), self.tensor(4, 640), self.tensor(1, 2560) * 0.01
-        a, gate = fast.legacy_shared_activation(x, gu, w)
-        g, u = gu.chunk(2, -1)
-        torch.testing.assert_close(a, F.silu(g) * u, atol=0.016, rtol=0.01)
-        torch.testing.assert_close(
-            gate, F.linear(x.float(), w.float()).to(x.dtype).sigmoid(), atol=0.004, rtol=0.01
-        )
-        packed = self.tensor(4, 5120)
-        r, s = packed.chunk(2, -1)
-        torch.testing.assert_close(
-            fast.legacy_moe_combine(packed, gate), r + s * gate, atol=0, rtol=0
-        )
 
     def test_moe_decode_launch_bound(self):
         from unittest.mock import patch
@@ -506,7 +500,7 @@ class FastTests(unittest.TestCase):
             or torch.cuda.get_device_capability()[0] != 10
         ):
             self.skipTest("FlashInfer Blackwell chunk prefill requires CUDA 13")
-        from minisgl.kernel.qwen4 import prefill_delta
+        from qwen4_test_utils import gdn_prefill as prefill_delta
 
         q, k = [ref.l2_norm(self.tensor(129, 8, 128)) for _ in range(2)]
         v = self.tensor(129, 24, 128)
@@ -514,7 +508,7 @@ class FastTests(unittest.TestCase):
         beta = torch.rand(129, 24, device="cuda", dtype=torch.bfloat16)
         state = torch.randn(24, 128, 128, device="cuda") * 0.1
         expected = state.clone()
-        target = gated_delta_rule(q, k, v, g, beta, expected)
+        target = ref.recurrent_delta(q, k, v, g, beta, expected)
         actual = prefill_delta(q, k, v, g, beta, state)
         self.assertEqual(state.dtype, torch.float32)
         torch.testing.assert_close(actual, target, atol=0.001, rtol=0.03)
@@ -526,7 +520,7 @@ class FastTests(unittest.TestCase):
             or torch.cuda.get_device_capability()[0] != 10
         ):
             self.skipTest("FlashInfer Blackwell chunk prefill requires CUDA 13")
-        from minisgl.kernel.qwen4 import prefill_delta_pool
+        from qwen4_test_utils import gdn_prefill_pool as prefill_delta_pool
 
         q, k = [ref.l2_norm(self.tensor(256, 8, 128)) for _ in range(2)]
         v = self.tensor(256, 24, 128)
@@ -538,7 +532,7 @@ class FastTests(unittest.TestCase):
         slots = torch.tensor([2, 0, 3], device="cuda", dtype=torch.int32)
         target = torch.cat(
             [
-                gated_delta_rule(q[a:b], k[a:b], v[a:b], g[a:b], beta[a:b], expected[slot])
+                ref.recurrent_delta(q[a:b], k[a:b], v[a:b], g[a:b], beta[a:b], expected[slot])
                 for a, b, slot in [(0, 129, 2), (129, 134, 0), (134, 256, 3)]
             ]
         )
@@ -553,44 +547,59 @@ class FastTests(unittest.TestCase):
         packed = self.tensor(4, 8240)
         a, b = packed[:, -48:-24], packed[:, -24:]
         log, dt = torch.randn(24, device="cuda"), torch.randn(24, device="cuda")
-        g, beta = fast.legacy_gdn_gates(a, b, log, dt)
+        from minisgl.kernel._qwen4_fla.fused_gdn_gating import fused_gdn_gating
+
+        g, beta = fused_gdn_gating(log, a, b, dt)
+        g, beta = g.reshape_as(a), beta.reshape_as(b)
         torch.testing.assert_close(g, -log.exp() * F.softplus(a.float() + dt), atol=2e-6, rtol=1e-6)
-        torch.testing.assert_close(beta, b.sigmoid(), atol=0, rtol=0)
+        torch.testing.assert_close(beta, b.sigmoid().float(), atol=0, rtol=0)
 
     def test_delta_replay_slots(self):
-        slots = torch.tensor([2, 0, 3, 3], device="cuda", dtype=torch.int32)
-        valid = torch.tensor([True, True, False, False], device="cuda")
-        q, k = [ref.l2_norm(self.tensor(4, 2, 128)) for _ in range(2)]
+        from minisgl.kernel._qwen4_fla.fused_gdn_gating import fused_gdn_gating
+        from minisgl.kernel._qwen4_fla.packed_decode import (
+            fused_recurrent_gated_delta_rule_packed_decode,
+        )
+        from qwen4_test_utils import l2
+
+        q, k = [l2(self.tensor(4, 2, 128)) for _ in range(2)]
         v = self.tensor(4, 6, 128)
-        g = -torch.rand(4, 6, device="cuda")
-        beta = torch.rand(4, 6, device="cuda", dtype=torch.bfloat16)
+        mixed = torch.cat([t.flatten(1) for t in (q, k, v)], -1)
+        a, b = self.tensor(4, 6), self.tensor(4, 6)
+        log, dt = torch.randn(6, device="cuda"), self.tensor(6)
+        g, beta = fused_gdn_gating(log, a, b, dt)
         state = torch.randn(4, 6, 128, 128, device="cuda") * 0.1
         expected = state.clone()
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            gated_delta_decode(q, k, v, g, beta, state, slots, valid)
-        torch.cuda.current_stream().wait_stream(stream)
-        state.copy_(expected)
+        slots = torch.tensor([2, 0, -1, -1], device="cuda", dtype=torch.int32)
+        out = torch.empty((4, 1, 6, 128), device="cuda", dtype=torch.bfloat16)
+
+        def run():
+            fused_recurrent_gated_delta_rule_packed_decode(
+                mixed, a, b, log, dt, 128**-0.5, state, out, slots, False
+            )
+
+        run()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            out = gated_delta_decode(q, k, v, g, beta, state, slots, valid)
-        for mapping in [[2, 0, 3, 3], [1, 2, 3, 3], [0, 1, 3, 3]]:
+            run()
+        state.copy_(expected)
+        for mapping in ([2, 0, -1, -1], [1, 2, -1, -1], [0, 1, -1, -1]):
             slots.copy_(torch.tensor(mapping, device="cuda", dtype=torch.int32))
-            ys = [
-                gated_delta_rule(
+            targets = [
+                ref.recurrent_delta(
                     q[i : i + 1],
                     k[i : i + 1],
                     v[i : i + 1],
-                    g[i : i + 1],
-                    beta[i : i + 1],
-                    expected[s],
+                    g[0, i : i + 1],
+                    beta[0, i : i + 1],
+                    expected[slot],
                 )
-                for i, s in enumerate(mapping[:2])
+                for i, slot in enumerate(mapping[:2])
             ]
             graph.replay()
-            torch.testing.assert_close(out[:2], torch.cat(ys), atol=0, rtol=0)
-            torch.testing.assert_close(state, expected, atol=0, rtol=0)
+            torch.testing.assert_close(out[:2, 0], torch.cat(targets), atol=0.002, rtol=0.02)
+            torch.testing.assert_close(state, expected, atol=2e-5, rtol=2e-4)
+            self.assertEqual(out[2:].count_nonzero().item(), 0)
+            torch.testing.assert_close(state[3], expected[3], atol=0, rtol=0)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 """Native BF16 text path for Qwen3.8-Flash-Next (Qwen4Exp).
 
 Explicit per-model policy, native graph decode, GPU/UVA PLE lookup overlap and TP.
-Each layer owns its production prefill/decode paths and aligned/legacy kernels.
+One production numerical path with specialized prefill/decode kernels.
 Visual inputs, MTP and quantization are not enabled.
 """
 
@@ -12,13 +12,7 @@ import torch.nn.functional as F
 from minisgl.core import get_global_ctx, get_qwen4_execution
 from minisgl.distributed import get_tp_info
 from minisgl.kernel import qwen4_ops as ops
-from minisgl.kernel.qwen4 import (
-    can_chunk_prefill,
-    gated_delta_decode,
-    prefill_delta,
-    prefill_delta_pool,
-)
-from minisgl.kernel.qwen4_ops import causal_conv, rms_norm
+from minisgl.kernel.qwen4_ops import causal_conv
 from minisgl.layers import BaseOP, LinearColParallelMerged, LinearOProj, LinearReplicated, MoELayer
 from minisgl.layers.base import OPList
 from minisgl.layers.embedding import ParallelLMHead, VocabParallelEmbedding
@@ -59,7 +53,6 @@ class NarrowLinear(LinearReplicated):
 class GatedResidual(BaseOP):
     def __init__(self, config: Qwen4Config, combine: bool = True) -> None:
         self.config: Qwen4Config = config
-        self.execution = get_qwen4_execution()
         self.h, self.n = config.hidden_size, config.hc_count
         self.eps = config.rms_norm_eps
         width = self.h * self.n
@@ -69,66 +62,50 @@ class GatedResidual(BaseOP):
         self.block_inject_weight = NarrowLinear(width, self.n, False) if combine else None
 
     def forward(self, residual):
-        if self.execution.aligned:
-            normed = ops.grouped_norm(residual, self.hc_norm.weight, self.h, self.eps)
-            # Cache hits change GEMM row counts. Both cuBLAS and the fused
-            # small-row HC path can then choose different reduction orders.
-            ctx = get_global_ctx()
-            stable_prefill = (
-                getattr(ctx.kv_cache, "stable_numerics", False) and ctx.batch.is_prefill
+        normed = ops.grouped_norm(residual, self.hc_norm.weight, self.h, self.eps)
+        # Cache hits change GEMM row counts. Both cuBLAS and the fused
+        # small-row HC path can then choose different reduction orders.
+        ctx = get_global_ctx()
+        stable_prefill = getattr(ctx.kv_cache, "stable_numerics", False) and ctx.batch.is_prefill
+        if stable_prefill:
+            mixed = ops.gr_project_mix_stable(
+                normed,
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                self.n,
+                self.h,
             )
-            if stable_prefill:
-                mixed = ops.gr_project_mix_stable(
-                    normed,
-                    self.input_mix_weight_down.weight,
-                    self.input_mix_weight_up.weight,
-                    self.n,
-                    self.h,
-                )
-            elif normed.shape[0] <= 24:
-                if hasattr(self, "_sg_up"):
-                    from minisgl.kernel._qwen4_cute.hc_mix import hc_mix
+        elif normed.shape[0] <= 24:
+            if hasattr(self, "_sg_up"):
+                from minisgl.kernel._qwen4_cute.hc_mix import hc_mix
 
-                    mixed = hc_mix(
-                        normed, self.input_mix_weight_down.weight, self._sg_up, self.n, self.h
-                    )
-                else:
-                    mixed = ops.gr_project_mix(
-                        normed,
-                        self.input_mix_weight_down.weight,
-                        self.input_mix_weight_up.weight,
-                        self.n,
-                    )
+                mixed = hc_mix(
+                    normed, self.input_mix_weight_down.weight, self._sg_up, self.n, self.h
+                )
             else:
-                mixed = ops.gr_project_mix_large(
+                mixed = ops.gr_project_mix(
                     normed,
                     self.input_mix_weight_down.weight,
                     self.input_mix_weight_up.weight,
                     self.n,
-                    self.h,
                 )
-            return mixed, normed
-        normed = ops.legacy_norm(residual, self.hc_norm.weight, self.eps, self.h)
-        if normed.shape[0] <= 16 and normed.shape[1] % 2048 == 0:
-            mixed = ops.legacy_gr_project_mix(
-                normed, self.input_mix_weight_down.weight, self.input_mix_weight_up.weight, self.n
-            )
         else:
-            gate = ops.legacy_silu_div(self.input_mix_weight_down.forward(normed), self.n)
-            gate = self.input_mix_weight_up.forward(gate)
-            mixed = ops.legacy_gr_mix(gate, normed, self.n)
+            mixed = ops.gr_project_mix_large(
+                normed,
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                self.n,
+                self.h,
+            )
         return mixed, normed
 
     def combine(self, residual, output, injection):
-        if self.execution.aligned:
-            return ops.gr_combine(residual, output, injection, self.block_inject_weight.weight)
-        return ops.legacy_gr_combine(residual, output, injection, self.block_inject_weight.weight)
+        return ops.gr_combine(residual, output, injection, self.block_inject_weight.weight)
 
 
 class GatedDeltaNet(BaseOP):
     def __init__(self, config: Qwen4Config, layer_id: int) -> None:
         self.config: Qwen4Config = config
-        self.execution = get_qwen4_execution()
         c, tp = config, get_tp_info().size
         h = config.hidden_size
         self.hk, self.hv = c.linear_num_key_heads // tp, c.linear_num_value_heads // tp
@@ -146,69 +123,6 @@ class GatedDeltaNet(BaseOP):
         self.out_proj = LinearOProj(vd, h, False)
 
     def forward(self, x):
-        if self.execution.aligned:
-            return self.forward_aligned(x)
-        ctx = get_global_ctx()
-        qkv, z, a, b = F.linear(x, self._packed).split(self._widths, -1)
-        qkv = qkv.contiguous()
-        z = z.reshape(-1, self.hv, self.dv).contiguous()
-        decay, beta = ops.legacy_gdn_gates(a, b, self.A_log, self.dt_bias)
-        kd, vd = self.hk * self.dk, self.hv * self.dv
-        m = ctx.batch.attn_metadata
-        if ctx.batch.is_decode:
-            mixed = ops.legacy_conv_decode(
-                qkv, self.conv1d.weight, ctx.kv_cache.conv[self.layer_id], m.slots, m.valid
-            )
-            q, k, v = mixed.split((kd, kd, vd), -1)
-            q, k = [ops.legacy_l2(t.reshape(-1, self.hk, self.dk)) for t in (q, k)]
-            output = gated_delta_decode(
-                q,
-                k,
-                v.reshape(-1, self.hv, self.dv),
-                decay,
-                beta,
-                ctx.kv_cache.recurrent[self.layer_id],
-                m.slots,
-                m.valid,
-            )
-        elif can_chunk_prefill(qkv):
-            mixed = torch.empty_like(qkv)
-            for slot, _, _, a, b in m.spans:
-                mixed[a:b] = causal_conv(
-                    qkv[a:b], self.conv1d.weight, ctx.kv_cache.conv[self.layer_id][slot]
-                )
-            q, k, v = mixed.split((kd, kd, vd), -1)
-            q, k = [ops.legacy_l2(t.reshape(-1, self.hk, self.dk)) for t in (q, k)]
-            output = prefill_delta_pool(
-                q,
-                k,
-                v.reshape(-1, self.hv, self.dv),
-                decay,
-                beta,
-                ctx.kv_cache.recurrent[self.layer_id],
-                m.slots,
-                m.cu_seqlens,
-            )
-        else:
-            output = torch.empty_like(z)
-            for slot, _, _, a, b in m.spans:
-                mixed = causal_conv(
-                    qkv[a:b], self.conv1d.weight, ctx.kv_cache.conv[self.layer_id][slot]
-                )
-                q, k, v = mixed.split((kd, kd, vd), -1)
-                q, k = [ops.legacy_l2(t.reshape(-1, self.hk, self.dk)) for t in (q, k)]
-                output[a:b] = prefill_delta(
-                    q,
-                    k,
-                    v.reshape(-1, self.hv, self.dv),
-                    decay[a:b],
-                    beta[a:b],
-                    ctx.kv_cache.recurrent[self.layer_id][slot],
-                )
-        y = ops.legacy_gdn_output(output, z, self.norm.weight, self.eps)
-        return self.out_proj.forward(y.flatten(1))
-
-    def forward_aligned(self, x):
         from minisgl.kernel._qwen4_fla.causal_conv import causal_conv1d_fn, causal_conv1d_update
         from minisgl.kernel._qwen4_fla.chunk import chunk_gated_delta_rule
         from minisgl.kernel._qwen4_fla.fused_gdn_gating import fused_gdn_gating
@@ -318,7 +232,6 @@ class QSAIndexer(BaseOP):
 class QSAAttention(BaseOP):
     def __init__(self, config: Qwen4Config, layer_id: int) -> None:
         self.config: Qwen4Config = config
-        self.execution = get_qwen4_execution()
         tp = get_tp_info().size
         self.layer_id = layer_id
         self.hq, self.hkv, self.dim = (
@@ -335,45 +248,29 @@ class QSAAttention(BaseOP):
         self.indexer = QSAIndexer(config)
 
     def forward(self, x):
-        ctx, rc = get_global_ctx(), self.config.rotary_config
+        ctx = get_global_ctx()
         pos = ctx.batch.positions
         linear = _prefill_linear(ctx)
-        if self.execution.aligned:
-            cut = sum(self._widths[:3])
-            qg, k, v = linear(x, self._packed[:cut]).split(self._widths[:3], -1)
-            iqk = linear(x, self._packed[cut:])
-        else:
-            qg, k, v, iqk = F.linear(x, self._packed).split(self._widths, -1)
+        cut = sum(self._widths[:3])
+        qg, k, v = linear(x, self._packed[:cut]).split(self._widths[:3], -1)
+        iqk = linear(x, self._packed[cut:])
         q, gate = qg.reshape(-1, self.hq, 2 * self.dim).chunk(2, -1)
         k = k.reshape(-1, self.hkv, self.dim)
         v = v.reshape(-1, self.hkv, self.dim).contiguous()
-        kwargs = {
-            "eps": self.config.rms_norm_eps,
-            "positions": pos,
-            "rotary_dim": rc.rotary_dim,
-            "base": rc.base,
-        }
 
         def norm(t, w):
-            if self.execution.aligned:
-                return ops.norm_rope(t, w, pos, self._rope_cache, self.config.rms_norm_eps)
-            return ops.legacy_norm(t, w, **kwargs)
+            return ops.norm_rope(t, w, pos, self._rope_cache, self.config.rms_norm_eps)
 
         q = norm(q, self.q_norm.weight)
         k = norm(k, self.k_norm.weight)
         ix = self.indexer
         iq, ik = iqk.split((ix.heads * ix.dim, ix.dim), -1)
         iq = iq.view(-1, ix.heads, ix.dim)
-        if self.execution.aligned:
-            iq = ops.index_norm_rope(
-                iq, ix.q_layernorm.weight, pos, self._rope_cache, self.config.rms_norm_eps
-            )
-        else:
-            iq = norm(iq, ix.q_layernorm.weight)
+        iq = ops.index_norm_rope(
+            iq, ix.q_layernorm.weight, pos, self._rope_cache, self.config.rms_norm_eps
+        )
         out = ctx.attn_backend.qsa(q, k, v, iq, ik, ix.k_layernorm.weight, self.layer_id)
-        if self.execution.aligned:
-            return _output_projection(self.o_proj, ops.sigmoid_mul(out, gate).flatten(1), linear)
-        return self.o_proj.forward((out * gate.sigmoid()).flatten(1))
+        return _output_projection(self.o_proj, ops.sigmoid_mul(out, gate).flatten(1), linear)
 
 
 class SharedMLP(BaseOP):
@@ -389,7 +286,6 @@ class SharedMLP(BaseOP):
 class SparseMoE(BaseOP):
     def __init__(self, config: Qwen4Config) -> None:
         self.config: Qwen4Config = config
-        self.execution = get_qwen4_execution()
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, False)
         self.experts = MoELayer(
             config.num_experts,
@@ -402,42 +298,26 @@ class SparseMoE(BaseOP):
         self.shared_expert_gate = NarrowLinear(config.hidden_size, 1, False)
 
     def forward(self, x):
-        if self.execution.aligned:
-            from minisgl.layers import silu_and_mul
-            from minisgl.moe.fused import fused_experts_impl
+        from minisgl.layers import silu_and_mul
+        from minisgl.moe.fused import fused_experts_impl
 
-            # The routed backend writes its result into its input buffer.
-            linear = _prefill_linear(get_global_ctx())
-            original = x.clone()
-            shared = silu_and_mul(linear(x, self._packed))
-            shared = linear(shared, self.shared_expert.down_proj.weight)
-            weights, ids = ops.router(linear(x, self.gate.weight), self.experts.top_k)
-            routed = fused_experts_impl(
-                x, self.experts.gate_up_proj, self.experts.down_proj, weights, ids
-            )
-            output = ops.moe_combine(
-                original,
-                self.shared_expert_gate.weight,
-                shared,
-                routed,
-                stable=linear is ops.linear_stable,
-            )
-            return self.experts._comm.all_reduce(output) if get_tp_info().size > 1 else output
-        shared = self.shared_expert
-        y, gate = ops.legacy_shared_activation(
-            x, F.linear(x, self._packed), self.shared_expert_gate.weight
+        # The routed backend writes its result into its input buffer.
+        linear = _prefill_linear(get_global_ctx())
+        original = x.clone()
+        shared = silu_and_mul(linear(x, self._packed))
+        shared = linear(shared, self.shared_expert.down_proj.weight)
+        weights, ids = ops.router(linear(x, self.gate.weight), self.experts.top_k)
+        routed = fused_experts_impl(
+            x, self.experts.gate_up_proj, self.experts.down_proj, weights, ids
         )
-        y = F.linear(y, shared.down_proj.weight)
-        # The routed implementation may overwrite x. Shared/gate must run first.
-        routed = self.experts.forward(x, self.gate.forward(x), reduce_results=False)
-        if get_tp_info().size > 1:
-            # Pack independent sums into one collective. Summing shared+routed
-            # before reduction changes BF16 rounding and can amplify MoE routing
-            # drift. Preserve the reference's two reduction results instead.
-            packed = self.experts._comm.all_reduce(torch.cat((routed, y), dim=-1))
-        else:
-            packed = torch.cat((routed, y), dim=-1)
-        return ops.legacy_moe_combine(packed, gate)
+        output = ops.moe_combine(
+            original,
+            self.shared_expert_gate.weight,
+            shared,
+            routed,
+            stable=linear is ops.linear_stable,
+        )
+        return self.experts._comm.all_reduce(output) if get_tp_info().size > 1 else output
 
 
 class NGramTable(VocabParallelEmbedding):
@@ -575,28 +455,24 @@ class PLE(BaseOP):
         # backend shares its workspace with attention and MoE.
         return table.reduce_embeddings(output)
 
+    def _norm(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return ops.grouped_norm(x, weight, self.config.hidden_size, self.config.rms_norm_eps)
+
     def forward_prefill(self, residual):
         ctx, cfg = get_global_ctx(), self.config
         c = cfg
         embeddings = self.consume_embeddings().view(residual.shape[0], -1)
-        h, n, eps = cfg.hidden_size, c.hc_count, cfg.rms_norm_eps
-
-        norm = rms_norm
-        if self.execution.aligned:
-            from minisgl.kernel.qwen4_ops import grouped_norm
-
-            def norm(x, w, eps, h):
-                return grouped_norm(x, w, h, eps)
+        h, n = cfg.hidden_size, c.hc_count
 
         linear = _prefill_linear(ctx)
-        key = norm(linear(embeddings, self.key_proj.weight), self.norm_key.weight, eps, h).view(
+        key = self._norm(linear(embeddings, self.key_proj.weight), self.norm_key.weight).view(
             -1, n, h
         )
-        query = norm(residual, self.norm_query.weight, eps, h).view(-1, n, h)
+        query = self._norm(residual, self.norm_query.weight).view(-1, n, h)
         gate = (key * query).sum(-1, keepdim=True) / math.sqrt(h)
         gate = gate.sign() * gate.abs().clamp_min(1e-6).sqrt()
         value = (gate.sigmoid() * linear(embeddings, self.value_proj.weight)[:, None]).flatten(1)
-        normed = norm(value, self.norm_conv.weight, eps, h)
+        normed = self._norm(value, self.norm_conv.weight)
         if ctx.batch.attn_metadata.track_offsets:
             ctx.kv_cache.track_states.capture_window(
                 "ple_conv", self.layer_id, normed, ctx.batch.attn_metadata
@@ -618,24 +494,14 @@ class PLE(BaseOP):
         cfg = self.config
         c, m = cfg, ctx.batch.attn_metadata
         emb = self.consume_embeddings().view(residual.shape[0], -1)
-        h, n, eps = cfg.hidden_size, c.hc_count, cfg.rms_norm_eps
+        h, n = cfg.hidden_size, c.hc_count
 
-        def norm(x, w):
-            if self.execution.aligned:
-                return ops.grouped_norm(x, w, h, eps)
-            return ops.legacy_norm(x, w, eps, h)
-
-        key = norm(self.key_proj.forward(emb), self.norm_key.weight).view(-1, n, h)
-        query = norm(residual, self.norm_query.weight).view(-1, n, h)
+        key = self._norm(self.key_proj.forward(emb), self.norm_key.weight).view(-1, n, h)
+        query = self._norm(residual, self.norm_query.weight).view(-1, n, h)
         gate = (key * query).sum(-1, keepdim=True) / math.sqrt(h)
-        if self.execution.aligned:
-            value = ops.ple_gate_value(gate, self.value_proj.forward(emb))
-        else:
-            gate = gate.sign() * gate.abs().clamp_min(1e-6).sqrt()
-            value = (gate.sigmoid() * self.value_proj.forward(emb)[:, None]).flatten(1)
-        normed = norm(value, self.norm_conv.weight)
-        conv = ops.ple_conv_decode if self.execution.aligned else ops.legacy_conv_decode
-        out = conv(
+        value = ops.ple_gate_value(gate, self.value_proj.forward(emb))
+        normed = self._norm(value, self.norm_conv.weight)
+        out = ops.ple_conv_decode(
             normed,
             self.conv1d.weight,
             ctx.kv_cache.ple_conv[self.layer_id],

@@ -132,14 +132,11 @@ def test_model_backend_and_pool_consume_the_same_typed_config():
         backend = create_attention_backend("qwen4", config)
         pool = create_kvcache_pool(config, 2, 4, torch.float32, torch.device("cpu"), 1)
     assert model.config is backend.config is config
-    assert model.execution is backend.execution is execution
+    assert model.execution is execution
     for layer in model.model.layers.op_list:
         assert layer.attn_hyper_connection.config is config
         assert layer.mlp.config is config
-        assert layer.mlp.execution is execution
-        assert layer.attn_hyper_connection.execution is execution
         assert (layer.linear_attn or layer.self_attn).config is config
-        assert (layer.linear_attn or layer.self_attn).execution is execution
         if layer.ple is not None:
             assert layer.ple.config is config
             assert layer.ple.execution is execution
@@ -160,8 +157,7 @@ def test_generic_config_cannot_construct_qwen4_components():
         create_attention_backend("qwen4", generic)
 
 
-@pytest.mark.parametrize("aligned", [False, True])
-def test_engine_graph_defaults_use_execution_without_replacing_model_config(aligned):
+def test_engine_graph_defaults_use_execution_without_replacing_model_config():
     from minisgl.engine import EngineConfig
     from minisgl.engine.engine import _adjust_config
 
@@ -169,7 +165,7 @@ def test_engine_graph_defaults_use_execution_without_replacing_model_config(alig
     config = EngineConfig("unused", DistributedInfo(0, 1), torch.bfloat16)
     object.__setattr__(config, "model_config", model_config)
     with (
-        qwen4_execution(aligned=aligned) as execution,
+        qwen4_execution() as execution,
         patch("minisgl.distributed.info._TP_INFO", config.tp_info),
     ):
         _adjust_config(config, execution)
@@ -187,3 +183,26 @@ def test_engine_can_disable_graph_capture():
     with qwen4_execution() as execution:
         _adjust_config(config, execution)
     assert config.cuda_graph_max_bs == 0
+
+
+@pytest.mark.parametrize(
+    "overrides, tp_size, error",
+    [
+        ({"hidden_size": 32}, 1, "hidden_size"),
+        ({"num_experts": 8}, 1, "512 experts"),
+        ({"indexer_budget": 8}, 1, "budget 2048"),
+        ({"indexer_compress_ratio": 2}, 1, "compression ratio 4"),
+        ({"indexer_head_dim": 8}, 1, "head dimension"),
+        ({}, 3, "TP size"),
+    ],
+)
+def test_kernel_shapes_are_rejected_before_weight_loading(overrides, tp_size, error):
+    from minisgl.engine.engine import _validate_qwen4_kernel_config
+
+    config = make_qwen4_config(
+        hidden_size=2560, num_experts=512, indexer_budget=2048, indexer_head_dim=128
+    )
+    _validate_qwen4_kernel_config(config, 1)
+    _validate_qwen4_kernel_config(config, 2)
+    with pytest.raises(ValueError, match=error):
+        _validate_qwen4_kernel_config(replace(config, **overrides), tp_size)

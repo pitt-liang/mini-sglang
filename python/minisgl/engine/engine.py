@@ -29,6 +29,26 @@ class ForwardOutput(NamedTuple):
     copy_done_event: torch.cuda.Event
 
 
+def _validate_qwen4_kernel_config(config: Qwen4Config, tp_size: int) -> None:
+    """Reject unsupported production kernel shapes before loading large weights."""
+    if config.hidden_size <= 0 or config.hidden_size % 512:
+        raise ValueError("Qwen4 grouped norm requires hidden_size to be a multiple of 512")
+    if config.num_experts != 512:
+        raise ValueError("Qwen4 router requires 512 experts")
+    if config.indexer_compress_ratio != 4 or config.indexer_budget != 2048:
+        raise ValueError("Qwen4 QSA requires compression ratio 4 and budget 2048")
+    if config.indexer_head_dim not in (64, 128, 256):
+        raise ValueError("Qwen4 index norm requires head dimension 64, 128 or 256")
+    heads = (
+        config.num_qo_heads,
+        config.num_kv_heads,
+        config.linear_num_key_heads,
+        config.linear_num_value_heads,
+    )
+    if tp_size <= 0 or any(h <= 0 or h % tp_size for h in heads):
+        raise ValueError("Qwen4 attention head counts must be divisible by TP size")
+
+
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
@@ -40,6 +60,8 @@ class Engine:
             resolve_qwen4_execution(self.device) if isinstance(model_config, Qwen4Config) else None
         )
         _adjust_config(config, execution)
+        if isinstance(model_config, Qwen4Config):
+            _validate_qwen4_kernel_config(model_config, config.tp_info.size)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
@@ -91,9 +113,8 @@ class Engine:
 
             self.kv_cache.prefix_states = Qwen4StatePool(self.kv_cache, self.state_cache_slots)
             assert execution is not None
-            self.kv_cache.internal_checkpoints = execution.aligned
-            if self.kv_cache.internal_checkpoints:
-                self.kv_cache.track_states = Qwen4StatePool(self.kv_cache, config.max_running_req)
+            self.kv_cache.internal_checkpoints = True
+            self.kv_cache.track_states = Qwen4StatePool(self.kv_cache, config.max_running_req)
             self.kv_cache.checkpoint_alignment = math.lcm(config.page_size, 64)
             self.kv_cache.checkpoint_interval = config.qwen4_checkpoint_interval
             logger.info_rank0(
@@ -224,10 +245,7 @@ class Engine:
                 if self.state_cache_slots < 1:
                     raise ValueError("Qwen4 state cache budget must fit at least one checkpoint")
                 state_bytes += self.state_cache_slots * per_state
-                execution = self.ctx.qwen4_execution
-                assert execution is not None
-                if execution.aligned:
-                    state_bytes += config.max_running_req * per_state
+                state_bytes += config.max_running_req * per_state
         num_pages = config.num_page_override
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory

@@ -4,6 +4,19 @@ import torch
 import torch.nn.functional as F
 
 
+def recurrent_delta(q, k, v, g, beta, state):
+    """Small FP32 mathematical oracle; state layout is [Hv, V, K]."""
+    repeats = v.shape[1] // q.shape[1]
+    q, k = [x.float().repeat_interleave(repeats, 1) for x in (q, k)]
+    output = []
+    for i in range(q.shape[0]):
+        state.mul_(g[i].float().exp()[:, None, None])
+        delta = (v[i].float() - (state * k[i, :, None]).sum(-1)) * beta[i].float()[:, None]
+        state.add_(delta[:, :, None] * k[i, :, None])
+        output.append((state * q[i, :, None]).sum(-1) * q.shape[-1] ** -0.5)
+    return torch.stack(output).to(v.dtype)
+
+
 def gated_residual(op, residual):
     norm = rms_norm(residual, op.hc_norm.weight, op.eps, op.h)
     gate = F.silu(F.linear(norm, op.input_mix_weight_down.weight) / op.n)

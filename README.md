@@ -148,10 +148,11 @@ paged sparse prefill and FP32 recurrent state. The Qwen4 scheduler maps the defa
 Vision, MTP and quantization are not supported. There is no internal reference
 model or CPU execution mode. `MINISGL_QWEN4_REFERENCE` has been removed; unset it
 (even `=0` is rejected). Use independent Transformers/SGLang tests for alignment.
-A GB200 numerical-alignment path is enabled by default on SM100/CUDA 13+.
-`MINISGL_QWEN4_SGLANG_NUMERICS=1` requires it explicitly; `=0` selects the older
-legacy fast path, which remains a production hardware-compatibility path.
-These switches are resolved into an immutable execution policy at worker startup,
+Qwen4 has one production numerical path, targeting SM100/CUDA 13+ with BF16.
+The previous aligned/legacy switch `MINISGL_QWEN4_SGLANG_NUMERICS` has been removed;
+unset it (both `=0` and `=1` are rejected). Unsupported devices and kernel shapes
+fail before weight loading; there is no implicit fallback to an older model path.
+PLE storage/prefetch flags are resolved into an immutable policy at worker startup,
 after selecting the device and before model construction and weight packing;
 changing the environment afterwards does not switch an existing model or graph.
 Alignment targets Torch dense GEMM, Triton MoE and FP32 recurrent state; stock
@@ -182,9 +183,9 @@ Test-only mathematical oracles are convenience checks, not independent ground tr
 Qwen4 prefix reuse shares QSA KV/index pages and restores an immutable checkpoint
 of **all** GDN recurrent/conv and PLE conv/token-history states into a private
 request slot. Checkpoints are aligned to `lcm(page_size, 64)`, including a replay
-boundary before the last prompt token. The aligned runtime records FP32 GDN
+boundary before the last prompt token. The runtime records FP32 GDN
 state inside a prefill chunk and gathers the matching GDN/PLE convolution windows,
-without splitting that forward. The legacy runtime stops at the boundary.
+without splitting that forward.
 Splitting a radix edge does not invent an intermediate recurrent state; matching
 falls back to the deepest complete checkpoint. Decode state is not published.
 
@@ -196,14 +197,14 @@ architecture fields, not execution flags, a `hybrid` dictionary or a
 CUDA. Model layers, attention, and the KV pool consume `Qwen4Config` directly;
 generic models do not carry Qwen4-only fields.
 
-Execution flags are registered in `env.py`: `MINISGL_QWEN4_SGLANG_NUMERICS`,
-`MINISGL_QWEN4_PLE_STORAGE`, and
+Execution flags are registered in `env.py`: `MINISGL_QWEN4_PLE_STORAGE` and
 `MINISGL_QWEN4_PLE_PREFETCH`. Unlike the older import-time env options, these are
 read and strictly validated at Qwen4 worker startup, after selecting its device.
-Boolean flags accept `0`/`1`; unset numerics selects SM100/CUDA 13+ automatically.
+Boolean flags accept `0`/`1`.
 The engine retains the resolved values as
-an immutable internal `Qwen4Execution` snapshot in its execution context, shared
-by model layers, attention and weight packing. They are not model config fields
+an immutable internal `Qwen4Execution` snapshot in its execution context, used
+by PLE and weight loading. Attention and other layers do not carry this policy.
+These options are not model config fields
 or another user configuration API. Changing env after startup does not switch
 an existing model's storage, kernels, or captured graphs; restart the worker.
 Other environment variable names and engine/scheduler CLI flags are unchanged.
@@ -275,11 +276,12 @@ Host memory bandwidth/topology and stream contention affect performance; offload
 does not guarantee lower latency on every device. No file-backed storage, CPU
 lookup worker, FP8 PLE or cross-DP embedding sharding is implemented.
 
-The implementation keeps model structure and legacy/aligned dispatch in
+The implementation keeps model structure and prefill/decode dispatch in
 `models/qwen4.py`, loading and packing in `models/qwen4_weight.py`, and GPU
-operators in `kernel/qwen4_ops.py` (older numerics use the `legacy_` prefix).
-Production Torch helpers (prefill convolution and legacy normalization/RoPE) also
-live in `kernel/qwen4_ops.py`; `models/qwen4_ops.py` has been removed. PLE uses
+operators in `kernel/qwen4_ops.py`. The legacy operators and standalone
+`kernel/qwen4.py` recurrence have been removed; GDN uses `_qwen4_fla` kernels.
+PLE prefill/decode share the fused grouped norm. Production Torch prefill
+convolution remains in `kernel/qwen4_ops.py`; `models/qwen4_ops.py` is removed. PLE uses
 Triton n-gram hashing for both packed variable-length prefill and decode: prefill
 reads immutable initial histories and commits final tails in a second launch;
 decode retains a fused one-token specialization. GDN recurrence, sparse QSA,
@@ -296,7 +298,6 @@ For a real-weight TP2 smoke test on two GB200 GPUs:
 
 ```bash
 smoke_dir=$(mktemp -d /tmp/minisgl-qwen4-smoke.XXXXXX)
-MINISGL_QWEN4_SGLANG_NUMERICS=1 \
 MINISGL_QWEN4_MNNVL=1 OMP_NUM_THREADS=4 \
   .venv/bin/torchrun --standalone --nproc-per-node=2 tests/models/smoke_qwen4.py \
   --model /path/to/Qwen3.8-Flash-Next --output "$smoke_dir/current"

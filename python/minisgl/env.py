@@ -111,7 +111,6 @@ class EnvClassSingleton:
     PYNCCL_MAX_BUFFER_SIZE = EnvMem(1024**3)
 
     # Qwen4 startup flags: read together after the worker selects its device.
-    QWEN4_SGLANG_NUMERICS = StartupEnvVar[bool | None](None, _strict_bool)
     QWEN4_PLE_STORAGE = StartupEnvVar[Literal["gpu", "pinned"]]("gpu", _ple_storage)
     QWEN4_PLE_PREFETCH = StartupEnvVar(False, _strict_bool)
 
@@ -136,11 +135,10 @@ ENV = EnvClassSingleton()
 class Qwen4Execution(NamedTuple):
     """Internal resolved worker state, not model metadata or a user config API.
 
-    The engine, weight loader and layers share this immutable snapshot. Never
-    re-read env during execution: packing and captured graphs depend on it.
+    The engine, weight loader and PLE share this immutable snapshot. Never
+    re-read env during execution: table storage and captured graphs depend on it.
     """
 
-    aligned: bool
     ple_storage: Literal["gpu", "pinned"]
     ple_prefetch: bool
 
@@ -156,7 +154,11 @@ def resolve_qwen4_execution(device: torch.device) -> Qwen4Execution:
         )
     if device.type != "cuda":
         raise ValueError("Qwen4 execution requires a CUDA device")
-    requested = ENV.QWEN4_SGLANG_NUMERICS.read()
+    if "MINISGL_QWEN4_SGLANG_NUMERICS" in os.environ:
+        raise ValueError(
+            "MINISGL_QWEN4_SGLANG_NUMERICS has been removed; unset it. "
+            "Qwen4 now has one production execution path."
+        )
     storage = ENV.QWEN4_PLE_STORAGE.read()
     prefetch = ENV.QWEN4_PLE_PREFETCH.read()
     supported = (
@@ -165,7 +167,6 @@ def resolve_qwen4_execution(device: torch.device) -> Qwen4Execution:
         and torch.version.cuda is not None
         and int(torch.version.cuda.split(".")[0]) >= 13
     )
-    if requested is True and not supported:
-        raise ValueError("Qwen4 aligned kernels currently require SM100 and CUDA 13+")
-    aligned = supported if requested is None else requested
-    return Qwen4Execution(aligned, storage, prefetch)
+    if not supported:
+        raise ValueError("Qwen4 kernels currently require SM100 and CUDA 13+")
+    return Qwen4Execution(storage, prefetch)

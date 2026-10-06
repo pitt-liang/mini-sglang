@@ -65,9 +65,40 @@ def make_qwen4_config(**overrides) -> Qwen4Config:
 def qwen4_execution(**overrides):
     """Install an isolated worker snapshot while constructing test components."""
     ctx = Context(1)
-    ctx.qwen4_execution = Qwen4Execution(False, "gpu", False)._replace(**overrides)
+    ctx.qwen4_execution = Qwen4Execution("gpu", False)._replace(**overrides)
     with patch("minisgl.core._GLOBAL_CTX", ctx):
         yield ctx.qwen4_execution
+
+
+def gdn_prefill_pool(q, k, v, g, beta, state, slots, cu):
+    """Exercise the production FLA prefill with already-normalized Q/K."""
+    from minisgl.kernel._qwen4_fla.chunk import chunk_gated_delta_rule
+
+    out, _, _ = chunk_gated_delta_rule(
+        q[None],
+        k[None],
+        v[None],
+        g[None],
+        beta.float()[None],
+        initial_state=state,
+        initial_state_indices=slots,
+        cu_seqlens=cu,
+        use_qk_l2norm_in_kernel=False,
+    )
+    return out[0]
+
+
+def gdn_prefill(q, k, v, g, beta, state):
+    return gdn_prefill_pool(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state[None],
+        torch.tensor([0], device=q.device, dtype=torch.int32),
+        torch.tensor([0, q.shape[0]], device=q.device, dtype=torch.int32),
+    )
 
 
 @tr.jit

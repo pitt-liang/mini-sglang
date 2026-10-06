@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from minisgl.models.config import ModelConfig, RotaryConfig
 from minisgl.models.qwen4_config import Qwen4Config
 from minisgl.utils.hf import cached_load_hf_config
-from qwen4_oracle import causal_conv, l2_norm, ngram_ids, rms_norm, rotary
+from qwen4_oracle import causal_conv, ngram_ids, rms_norm, rotary
 from qwen4_test_utils import make_qwen4_config, qwen4_execution
 
 
@@ -165,29 +165,36 @@ class Qwen4OpsTest(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_norm_and_gr_against_hf(self):
         from minisgl.models.qwen4 import GatedResidual
+        from minisgl.utils.torch_utils import torch_dtype
 
         ref = independent_hf_reference()
         torch.manual_seed(5)
         cfg = make_qwen4_config(
-            hidden_size=32,
+            hidden_size=512,
             hc_count=4,
             hc_lowrank=8,
             rms_norm_eps=1e-6,
         )
-        with qwen4_execution():
+        with qwen4_execution(), torch_dtype(torch.bfloat16):
             mine = GatedResidual(cfg)
-        golden = ref["Qwen4ExpTextGatedResidual"](cfg).cuda()
+        golden = ref["Qwen4ExpTextGatedResidual"](cfg).to(device="cuda", dtype=torch.bfloat16)
         for name, value in golden.state_dict().items():
             value.normal_(0, 0.1)
         mine.load_state_dict(dict(golden.state_dict()))
-        x = torch.randn(7, 128, device="cuda")
+        x = torch.randn(7, 2048, device="cuda", dtype=torch.bfloat16)
         expected, residual, injection = golden(x)
-        actual, gate = mine.forward(x)
-        torch.testing.assert_close(actual, expected)
+        with patch(
+            "minisgl.models.qwen4.get_global_ctx",
+            return_value=SimpleNamespace(kv_cache=SimpleNamespace(stable_numerics=False)),
+        ):
+            actual, gate = mine.forward(x)
+        torch.testing.assert_close(actual, expected, atol=0.008, rtol=0.02)
         # Production retains normalized residuals, not the materialized injection.
         torch.testing.assert_close(
             mine.combine(x, actual, gate),
-            (residual.view(7, 4, 32) + injection[..., None] * expected[:, None]).flatten(1),
+            (residual.view(7, 4, 512) + injection[..., None] * expected[:, None]).flatten(1),
+            atol=0.032,
+            rtol=0.02,
         )
 
     def test_ngram_eos_and_chunks_against_hf(self):
@@ -310,8 +317,8 @@ class Qwen4OpsTest(unittest.TestCase):
             "layer_types": ("full_attention",),
             "linear_conv_kernel_dim": 4,
             "indexer_compress_ratio": 4,
-            "indexer_head_dim": 8,
-            "indexer_budget": 8,
+            "indexer_head_dim": 128,
+            "indexer_budget": 2048,
             "ple_layer_ids": (),
             "eos_token_id": 17,
         }
@@ -319,20 +326,25 @@ class Qwen4OpsTest(unittest.TestCase):
             **c,
             num_kv_heads=2,
             num_layers=1,
-            head_dim=32,
+            head_dim=128,
             rms_norm_eps=1e-6,
-            rotary_config=RotaryConfig(32, 4, 128, 10000.0, None),
+            rotary_config=RotaryConfig(128, 64, 128, 10000.0, None),
         )
         tp = SimpleNamespace(rank=0, size=1)
         with (
             patch("minisgl.kvcache.qwen4_pool.get_tp_info", return_value=tp),
             patch("minisgl.kvcache.mha_pool.get_tp_info", return_value=tp),
         ):
-            pool = Qwen4KVCache(cfg, 8, 4, torch.float32, torch.device("cuda"), 2)
+            pool = Qwen4KVCache(cfg, 8, 4, torch.bfloat16, torch.device("cuda"), 2)
         # Noncontiguous page order catches logical/physical compressed-block mixups.
         table = (
             (
-                (torch.tensor([[3, 0, 6, 2], [1, 7, 4, 5]], device="cuda")[:, :, None] * 4)
+                (
+                    torch.tensor([[3, 0, 6, 2], [1, 7, 4, 5]], device="cuda", dtype=torch.bfloat16)[
+                        :, :, None
+                    ]
+                    * 4
+                )
                 + torch.arange(4, device="cuda")
             )
             .flatten(1)
@@ -342,19 +354,22 @@ class Qwen4OpsTest(unittest.TestCase):
         with qwen4_execution():
             backend = Qwen4Backend(cfg)
         n = 13
-        q = torch.randn(n, 4, 32, device="cuda")
-        k, v = [torch.randn(n, 2, 32, device="cuda") for _ in range(2)]
-        iq, raw = torch.randn(n, 4, 8, device="cuda"), torch.randn(n, 8, device="cuda")
-        weight = torch.randn(8, device="cuda") * 0.1
-        pooled = raw[:12].view(3, 4, 8).mean(1)
+        q = torch.randn(n, 4, 128, device="cuda", dtype=torch.bfloat16)
+        k, v = [torch.randn(n, 2, 128, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+        iq, raw = (
+            torch.randn(n, 4, 128, device="cuda", dtype=torch.bfloat16),
+            torch.randn(n, 128, device="cuda", dtype=torch.bfloat16),
+        )
+        weight = torch.randn(128, device="cuda", dtype=torch.bfloat16) * 0.1
+        pooled = raw[:12].view(3, 4, 128).mean(1)
         pooled = rotary(
-            rms_norm(pooled, weight)[:, None], torch.arange(0, 12, 4, device="cuda"), 4, 10000.0
+            rms_norm(pooled, weight)[:, None], torch.arange(0, 12, 4, device="cuda"), 64, 10000.0
         )[:, 0]
         expected = []
         for t in range(n):
             complete = (t + 1) // 4
             score = (iq[t] @ pooled[:complete].T).relu().sum(0)
-            blocks = score.topk(min(2, complete)).indices
+            blocks = score.topk(min(512, complete)).indices
             selected = torch.cat(
                 (
                     (blocks[:, None] * 4 + torch.arange(4, device="cuda")).flatten(),
@@ -363,7 +378,7 @@ class Qwen4OpsTest(unittest.TestCase):
             )
             keys = k[selected].repeat_interleave(2, 1).transpose(0, 1)
             values = v[selected].repeat_interleave(2, 1).transpose(0, 1)
-            probs = (q[t, :, None] @ keys.transpose(-1, -2) / 32**0.5).softmax(-1)
+            probs = (q[t, :, None] @ keys.transpose(-1, -2) / 128**0.5).softmax(-1)
             expected.append((probs @ values)[:, 0])
         expected = torch.stack(expected)
 
@@ -377,7 +392,7 @@ class Qwen4OpsTest(unittest.TestCase):
                         out_loc=table[slot, start:end],
                         attn_metadata=Qwen4Metadata(
                             ((slot, start, end, 0, length),),
-                            torch.tensor([length - 1], device="cuda"),
+                            torch.tensor([length - 1], device="cuda", dtype=torch.bfloat16),
                         ),
                     )
                     result.append(
@@ -394,13 +409,13 @@ class Qwen4OpsTest(unittest.TestCase):
                     start = end
             return torch.cat(result)
 
-        torch.testing.assert_close(run([13], 0), expected, atol=2e-6, rtol=1e-5)
-        torch.testing.assert_close(run([3, 2, 6, 2], 1), expected, atol=2e-6, rtol=1e-5)
-        torch.testing.assert_close(run([1] * 13, 0), expected, atol=2e-6, rtol=1e-5)
+        torch.testing.assert_close(run([13], 0), expected, atol=0.016, rtol=0.02)
+        torch.testing.assert_close(run([3, 2, 6, 2], 1), expected, atol=0.016, rtol=0.02)
+        torch.testing.assert_close(run([1] * 13, 0), expected, atol=0.016, rtol=0.02)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_gdn_cuda_against_hf(self):
-        from minisgl.kernel.qwen4 import gated_delta_rule
+        from qwen4_test_utils import gdn_prefill, l2
 
         ref = independent_hf_reference()
         torch.manual_seed(3)
@@ -413,32 +428,28 @@ class Qwen4OpsTest(unittest.TestCase):
             beta = torch.rand(length, 6, device="cuda", dtype=torch.bfloat16)
             initial = torch.randn(6, 128, 128, device="cuda") * 0.1
             state = initial.clone()
-            actual = gated_delta_rule(l2_norm(q), l2_norm(k), v, g, beta, state)
+            actual = gdn_prefill(l2(q), l2(k), v, g, beta, state)
             for algorithm in ("torch_recurrent_gated_delta_rule", "torch_chunk_gated_delta_rule"):
                 expected, final = ref[algorithm](
-                    q.repeat_interleave(3, 1)[None],
-                    k.repeat_interleave(3, 1)[None],
+                    l2(q).repeat_interleave(3, 1)[None],
+                    l2(k).repeat_interleave(3, 1)[None],
                     v[None],
                     g[None],
                     beta[None],
                     initial_state=initial.transpose(-1, -2)[None],
                     output_final_state=True,
-                    use_qk_l2norm_in_kernel=True,
+                    use_qk_l2norm_in_kernel=False,
                 )
                 torch.testing.assert_close(actual, expected[0], atol=0.002, rtol=0.02)
-                torch.testing.assert_close(state, final[0].transpose(-1, -2), atol=2e-5, rtol=2e-4)
+                torch.testing.assert_close(state, final[0].transpose(-1, -2), atol=0.005, rtol=0.03)
             if length > 1:
                 state2 = initial.clone()
                 split = min(3, length - 1)
                 chunks = []
                 for sl in (slice(0, split), slice(split, length)):
-                    chunks.append(
-                        gated_delta_rule(
-                            l2_norm(q[sl]), l2_norm(k[sl]), v[sl], g[sl], beta[sl], state2
-                        )
-                    )
-                torch.testing.assert_close(torch.cat(chunks), actual, atol=0, rtol=0)
-                torch.testing.assert_close(state2, state, atol=0, rtol=0)
+                    chunks.append(gdn_prefill(l2(q[sl]), l2(k[sl]), v[sl], g[sl], beta[sl], state2))
+                torch.testing.assert_close(torch.cat(chunks), actual, atol=0.002, rtol=0.02)
+                torch.testing.assert_close(state2, state, atol=0.005, rtol=0.03)
 
 
 class Qwen4PackingTest(unittest.TestCase):
@@ -448,43 +459,41 @@ class Qwen4PackingTest(unittest.TestCase):
         def projection(value, rows=1):
             return SimpleNamespace(weight=torch.full((rows, 4), float(value)))
 
-        for aligned in (False, True):
-            with self.subTest(aligned=aligned):
-                attn = SimpleNamespace(
-                    in_proj_qkv=projection(1, 3),
-                    in_proj_z=projection(2, 2),
-                    in_proj_a=projection(3),
-                    in_proj_b=projection(4),
+        attn = SimpleNamespace(
+            in_proj_qkv=projection(1, 3),
+            in_proj_z=projection(2, 2),
+            in_proj_a=projection(3),
+            in_proj_b=projection(4),
+        )
+        mlp = SimpleNamespace(
+            shared_expert=SimpleNamespace(gate_proj=projection(5), up_proj=projection(6))
+        )
+        model = SimpleNamespace(
+            config=make_qwen4_config(),
+            model=SimpleNamespace(
+                layers=SimpleNamespace(
+                    op_list=[SimpleNamespace(linear_attn=attn, self_attn=None, mlp=mlp)]
                 )
-                mlp = SimpleNamespace(
-                    shared_expert=SimpleNamespace(gate_proj=projection(5), up_proj=projection(6))
-                )
-                model = SimpleNamespace(
-                    config=make_qwen4_config(),
-                    model=SimpleNamespace(
-                        layers=SimpleNamespace(
-                            op_list=[SimpleNamespace(linear_attn=attn, self_attn=None, mlp=mlp)]
-                        )
-                    ),
-                )
-                # Isolate projection layout from the SM100-specific HC permutation.
-                with (
-                    patch("torch.cuda.get_device_capability", return_value=(9, 0)),
-                    qwen4_execution(aligned=aligned) as execution,
-                ):
-                    model.execution = execution
-                    pack_qwen4_weights(model)
-                expected = [1, 1, 1, 2, 2] + ([4, 3] if aligned else [3, 4])
-                torch.testing.assert_close(attn._packed[:, 0], torch.tensor(expected).float())
-                torch.testing.assert_close(mlp._packed[:, 0], torch.tensor([5.0, 6.0]))
-                for name in ("qkv", "z", "a", "b"):
-                    weight = getattr(attn, f"in_proj_{name}").weight
-                    self.assertEqual(
-                        weight.untyped_storage().data_ptr(),
-                        attn._packed.untyped_storage().data_ptr(),
-                    )
-                attn.in_proj_a.weight.fill_(9)
-                self.assertEqual(attn._packed[-1 if aligned else -2, 0].item(), 9)
+            ),
+        )
+        # Isolate projection layout from the SM100-specific HC permutation.
+        with (
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+            qwen4_execution() as execution,
+        ):
+            model.execution = execution
+            pack_qwen4_weights(model)
+        expected = [1, 1, 1, 2, 2, 4, 3]
+        torch.testing.assert_close(attn._packed[:, 0], torch.tensor(expected).float())
+        torch.testing.assert_close(mlp._packed[:, 0], torch.tensor([5.0, 6.0]))
+        for name in ("qkv", "z", "a", "b"):
+            weight = getattr(attn, f"in_proj_{name}").weight
+            self.assertEqual(
+                weight.untyped_storage().data_ptr(),
+                attn._packed.untyped_storage().data_ptr(),
+            )
+        attn.in_proj_a.weight.fill_(9)
+        self.assertEqual(attn._packed[-1, 0].item(), 9)
 
     def test_unresolved_policy_rejected(self):
         from minisgl.core import Context
