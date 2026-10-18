@@ -4,23 +4,16 @@
 import contextlib
 import functools
 import inspect
-import logging
 import os
-import sys
 from enum import Enum
 from functools import lru_cache
 from typing import Any, Callable, Dict, Literal, Optional, Tuple
 
 import torch
 import triton
-from packaging import version
 
 torch_release = tuple(int(part) for part in torch.__version__.split(".")[:2])
 
-logger = logging.getLogger(__name__)
-
-COMPILER_MODE = os.getenv("FLA_COMPILER_MODE") == "1"
-FLA_CI_ENV = os.getenv("FLA_CI_ENV") == "1"
 FLA_CACHE_RESULTS = os.getenv("FLA_CACHE_RESULTS", "1") == "1"
 
 
@@ -31,70 +24,6 @@ SUPPORTS_AUTOTUNE_CACHE = (
 autotune_cache_kwargs = (
     {"cache_results": FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
 )
-
-
-@lru_cache(maxsize=1)
-def check_environments():
-    """
-    Checks the current operating system, Triton version, and Python version,
-    issuing warnings if they don't meet recommendations.
-    This function's body only runs once due to lru_cache.
-    """
-    # Check Operating System
-    if sys.platform == "win32":
-        logger.warning(
-            "Detected Windows operating system. Triton does not have an official Windows release, "
-            "thus FLA will not be adapted for Windows, and any potential errors will not be fixed. "
-            "Please consider using a Linux environment for compatibility."
-        )
-
-    triton_version = version.parse(triton.__version__)
-    required_triton_version = version.parse("3.2.0")
-
-    if triton_version < required_triton_version:
-        logger.warning(
-            f"Current Triton version {triton_version} is below the recommended 3.2.0 version. "
-            "Errors may occur and these issues will not be fixed. "
-            "Please consider upgrading Triton."
-        )
-
-    # Check Python version
-    py_version = version.parse(f"{sys.version_info.major}.{sys.version_info.minor}")
-    required_py_version = version.parse("3.11")
-
-    if py_version < required_py_version:
-        logger.warning(
-            f"Current Python version {py_version} is below the recommended 3.11 version. "
-            "It is recommended to upgrade to Python 3.11 or higher for the best experience."
-        )
-
-    return None
-
-
-def get_abs_err(x, y):
-    return (x.detach() - y.detach()).flatten().abs().max().item()
-
-
-def get_err_ratio(x, y):
-    err = (x.detach() - y.detach()).flatten().square().mean().sqrt().item()
-    base = (x.detach()).flatten().square().mean().sqrt().item()
-    return err / (base + 1e-8)
-
-
-def assert_close(prefix, ref, tri, ratio, warning=False, err_atol=1e-6):
-    abs_atol = get_abs_err(ref, tri)
-    msg = f"{prefix} diff: {abs_atol:.6f} ratio: {get_err_ratio(ref, tri):.6f}"
-    logger.info(msg)
-    error_rate = get_err_ratio(ref, tri)
-    if abs_atol <= err_atol:
-        return
-    if warning or (FLA_CI_ENV and (error_rate < 0.01 or abs_atol <= 0.3)):
-        if error_rate > ratio:
-            import warnings
-
-            warnings.warn(msg)
-    else:
-        assert error_rate < ratio, msg
 
 
 SUPPRESS_LEVEL = int(os.getenv("GDN_RECOMPUTE_SUPPRESS_LEVEL", "0"))
@@ -179,61 +108,12 @@ def input_guard(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
     return wrapper
 
 
-contiguous = input_guard
-
-
-def require_version(version, hint):
-    """
-    Perform a runtime check of the dependency versions, using the exact same syntax used by pip.
-    """
-
-    def decorator(fn):
-        @functools.wraps(fn)
-        def wrapper(ctx, *args, **kwargs):
-            from transformers.utils.versions import require_version
-
-            require_version(version, hint)
-            return fn(
-                ctx,
-                *(
-                    i if not isinstance(i, torch.Tensor) else i.contiguous()
-                    for i in args
-                ),
-                **{
-                    k: (v if not isinstance(v, torch.Tensor) else v.contiguous())
-                    for k, v in kwargs.items()
-                },
-            )
-
-        return wrapper
-
-    return decorator
-
-
-def checkpoint(fn):
-    def wrapper(*args, **kwargs):
-        return torch.utils.checkpoint.checkpoint(fn, *args, **kwargs)
-
-    return wrapper
-
-
 def _cpu_device_warning():
     import warnings
 
     warnings.warn(
         ("Triton is not supported on current platform, roll back to CPU."), stacklevel=1
     )
-
-
-@lru_cache(maxsize=None)
-def get_multiprocessor_count(tensor_idx: int = 0) -> int:
-    try:
-        return triton.runtime.driver.active.utils.get_device_properties(tensor_idx)[
-            "multiprocessor_count"
-        ]
-    except BaseException:
-        _cpu_device_warning()
-        return -1
 
 
 @lru_cache(maxsize=None)
@@ -265,19 +145,10 @@ device = get_available_device() if get_available_device() != "hip" else "cuda"
 device_torch_lib = getattr(torch, device)
 device_platform = _check_platform()
 
-is_amd = device_platform == "amd"
-is_intel = device_platform == "intel"
 is_nvidia = device_platform == "nvidia"
-is_intel_alchemist = is_intel and "Intel(R) Arc(TM) A" in torch.xpu.get_device_name(0)
-is_nvidia_hopper = is_nvidia and (
-    "NVIDIA H" in torch.cuda.get_device_name(0)
-    or torch.cuda.get_device_capability()[0] >= 9
-)
-use_cuda_graph = is_nvidia and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
 
 # Nvidia Ampere or newer, haven't check AMD and intel yet.
 is_tf32_supported = is_nvidia and torch.cuda.get_device_capability(0)[0] >= 8
-is_gather_supported = hasattr(triton.language, "gather")
 
 
 def get_all_max_shared_mem():
@@ -320,7 +191,6 @@ def check_shared_mem(arch: str = "none", tensor_idx: int = 0) -> bool:
 if torch_release >= (2, 4):
     device = "cuda" if device == "cpu" else device
     autocast_custom_fwd = functools.partial(torch.amp.custom_fwd, device_type=device)
-    autocast_custom_bwd = functools.partial(torch.amp.custom_bwd, device_type=device)
 
     def custom_device_ctx(index: int):
         return device_torch_lib.device(index)
@@ -330,10 +200,6 @@ else:
         "Only cuda device is supported for PyTorch version < 2.4.0."
     )
     autocast_custom_fwd = device_torch_lib.amp.custom_fwd
-    autocast_custom_bwd = device_torch_lib.amp.custom_bwd
 
     def custom_device_ctx(index: int):
         return torch.cuda.device(index)
-
-
-device_platform = get_available_device()

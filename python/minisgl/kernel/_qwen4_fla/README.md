@@ -11,6 +11,34 @@ inspection; removal of the unrelated Intel runtime override from chunk.py;
 only GDN packed decode retained from fused_recurrent.py. No SGLang scheduler,
 model, runtime context, or request/cache manager is imported.
 
+## Retained entry points and pruning boundary
+
+This is a private inference dependency, not a general FLA API. The model imports
+`causal_conv1d_fn`, `causal_conv1d_update`, `chunk_gated_delta_rule`,
+`fused_gdn_gating`, and `fused_recurrent_gated_delta_rule_packed_decode`.
+The chunk entry point retains its transitive L2 normalization, cumsum, chunk
+index/offset, intra-chunk solve, W/U reconstruction, state update and output
+dependencies. Checkpoint tests also call the chunk entry point directly.
+
+A repository-wide production/test call-site audit removed:
+
+- `gdn_prefill_qkv_prepare_fwd` and its exclusive materialization kernel: no caller;
+  the model uses chunk prefill and `l2norm_fwd` instead of this FlashInfer adapter.
+- `L2NormFunction`, `l2norm`/`l2_norm`, and `L2Norm`: an unreferenced wrapper chain;
+  production calls `l2norm_fwd` directly.
+- The unused `fwd_recompute_w_u` alias; `recompute_w_u_fwd` remains in use.
+- Unused environment-check/error-reporting, training checkpoint/version-check,
+  backward-autocast and multiprocessor-query helpers, their exclusive flags,
+  and unused log/gather/tensor-descriptor exports.
+- Tuning tables referenced only by commented-out autotune decorators. Active
+  autotune configurations and their capability checks are unchanged.
+
+Shape-conditional implementations are not dead entries: both L2 kernels and
+scalar/vector cumsum remain reachable from their retained wrappers. Their
+arithmetic is unchanged and is covered by `test_qwen4_fla_primitives.py`.
+Do not remove state tracking, slot masks, ragged inputs or graph support based
+only on the default model shape or a single observed execution trace.
+
 `causal_conv.py` comes from `kernels/ops/mamba/causal_conv1d_triton.py`
 at the same revision. Its runtime PDL capability query is replaced with a
 local constant `False`; this changes launch scheduling, not arithmetic.

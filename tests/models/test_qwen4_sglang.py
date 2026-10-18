@@ -98,11 +98,46 @@ class TestSGLangNumerics(unittest.TestCase):
             )
 
     def test_gdn_l2(self):
-        from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+        from minisgl.kernel._qwen4_fla.l2norm import l2norm_fwd as actual
+        from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd as expected
 
         for rows in (1, 5, 128, 2053):
-            x = self.tensor(rows, 8, 128)
-            torch.testing.assert_close(oracle.l2(x), l2norm_fwd(x), atol=0, rtol=0)
+            for dim in (128, 1024):
+                with self.subTest(rows=rows, dim=dim):
+                    x = self.tensor(rows, 8, dim)
+                    torch.testing.assert_close(actual(x), expected(x), atol=0, rtol=0)
+
+    def test_hc_mix_and_graph(self):
+        from minisgl.kernel._qwen4_cute.hc_mix import hc_mix, permute_pad_up_weight
+        from sglang.kernels.ops.elementwise.hc_mix import hc_mix as expected
+        from sglang.kernels.ops.elementwise.hc_mix import (
+            permute_pad_up_weight as expected_pack,
+        )
+
+        if torch.cuda.get_device_capability()[0] != 10:
+            self.skipTest("HC split-K requires SM100")
+        down = self.tensor(320, 10240) * 0.01
+        up = self.tensor(10240, 320) * 0.01
+        packed = permute_pad_up_weight(up, 4)
+        torch.testing.assert_close(packed, expected_pack(up, 4), atol=0, rtol=0)
+        # 33 rows exercises both the 32-row scratch buffer and its tail.
+        for rows in (1, 5, 24, 33):
+            with self.subTest(rows=rows):
+                x = self.tensor(rows, 10240)
+                actual = hc_mix(x, down, packed, 4, 2560)
+                torch.testing.assert_close(
+                    actual, expected(x, down, packed, 4, 2560), atol=0, rtol=0
+                )
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = hc_mix(x, down, packed, 4, 2560)
+                for _ in range(2):
+                    x.copy_(self.tensor(rows, 10240))
+                    graph.replay()
+                    torch.testing.assert_close(
+                        captured, expected(x, down, packed, 4, 2560), atol=0, rtol=0
+                    )
 
     def test_ple_decode_gate_conv_and_padding(self):
         import torch.nn.functional as F

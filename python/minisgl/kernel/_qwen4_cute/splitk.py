@@ -165,39 +165,6 @@ def validate_tactic(
         )
 
 
-def autotune_tactics(
-    m: int,
-    n: int,
-    k: int,
-    *,
-    smem_capacity: int = _SMEM_CAPACITY_BYTES,
-) -> list[SplitKTactic]:
-    """Return valid tactics in the shape-specific stage window."""
-    tactics: list[SplitKTactic] = []
-    for mma_m in _SUPPORTED_MMA_M:
-        for mma_n in _SUPPORTED_MMA_N:
-            for split_k in _SUPPORTED_SPLIT_K:
-                base = SplitKTactic(mma_m, mma_n, split_k, _MIN_AB_STAGES)
-                try:
-                    validate_tactic(base, m, n, k, smem_capacity=smem_capacity)
-                except ValueError:
-                    continue
-                max_stages = _max_ab_stages_for(base, smem_capacity)
-                # Short K favors shallow pipelines; long K stays near the cap.
-                tactics.extend(
-                    dataclasses.replace(base, ab_stages=ab_stages)
-                    for ab_stages in (
-                        range(_MIN_AB_STAGES, min(max_stages, 6) + 1)
-                        if k <= 4 * _CTA_K
-                        else range(
-                            min(max(5, max_stages - 2), max_stages),
-                            max_stages + 1,
-                        )
-                    )
-                )
-    return tactics
-
-
 def default_tactic(m: int, n: int, k: int) -> SplitKTactic:
     """Choose the default occupancy-oriented tactic."""
     if n <= 512:
@@ -241,9 +208,7 @@ def default_tactic(m: int, n: int, k: int) -> SplitKTactic:
 
 __all__ = [
     "SplitKTactic",
-    "autotune_tactics",
     "default_tactic",
-    "run_splitk_dense",
     "run_splitk_dense_silu",
     "run_splitk_dense_gate",
 ]
@@ -948,27 +913,6 @@ def _bmm_no_bias(
 
 
 @cute.experimental.jit
-def _bmm_bias(
-    gemm_op: cutlass.Constexpr,
-    a: cute.Tensor,
-    b: cute.Tensor,
-    c: cute.Tensor,
-    bias: cute.Tensor,
-    stream: _cuda.CUstream,
-):
-    c_swapped = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0]))
-    gemm_op(
-        cute.make_tensor(a.iterator, cute.select(a.layout, mode=[1, 2, 0])),
-        cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0])),
-        c_swapped,
-        cute.make_tensor(bias.iterator, cute.select(bias.layout, mode=[1, 2, 0])),
-        c_swapped,
-        c_swapped,
-        stream,
-    )
-
-
-@cute.experimental.jit
 def _bmm_gate(
     gemm_op: cutlass.Constexpr,
     a: cute.Tensor,
@@ -1017,11 +961,10 @@ def _make_layout_tensor(
 
 def _make_compile_repr_tensors(
     dtype: _torch.dtype,
-    has_bias: bool,
     a_leading: int,
     b_leading: int,
     c_leading: int,
-    epilogue_mode: str = "none",
+    epilogue_mode: str,
 ):
     m, n, k, batch = 64, 8, _CTA_K, 1
     tensors = tuple(
@@ -1040,21 +983,10 @@ def _make_compile_repr_tensors(
             _from_dlpack_dynamic(_torch.empty((n, m), dtype=dtype, device="cuda"), 1),
             _from_dlpack_dynamic(_torch.empty((n, m), dtype=dtype, device="cuda"), 1),
         )
-    if not has_bias:
-        return (*tensors, None)
-    return (
-        *tensors,
-        _from_dlpack_dynamic(
-            _torch.empty((n,), dtype=dtype, device="cuda").as_strided(
-                size=(batch, n, m), stride=(0, 1, 0)
-            ),
-            1,
-            2,
-        ),
-    )
+    return tensors
 
 
-def _to_cute_swap(a, b, out, bias):
+def _to_cute_swap(a, b, out):
     a_swap = b.unsqueeze(0).transpose(-2, -1)
     b_swap = a.unsqueeze(0).transpose(-2, -1)
     c_swap = out.unsqueeze(0).transpose(-2, -1)
@@ -1067,19 +999,7 @@ def _to_cute_swap(a, b, out, bias):
             (a_swap, b_swap, c_swap), leading_dims, strict=True
         )
     )
-    if bias is None:
-        return (*cute_tensors, None, leading_dims)
-    return (
-        *cute_tensors,
-        _from_dlpack_dynamic(
-            bias.as_strided(
-                size=(1, c_swap.shape[1], c_swap.shape[2]), stride=(0, 1, 0)
-            ),
-            1,
-            2,
-        ),
-        leading_dims,
-    )
+    return (*cute_tensors, leading_dims)
 
 
 # Tactic hashes all compile-time tile, split, and stage fields.
@@ -1090,9 +1010,8 @@ def _get_compiled_splitk_kernel(
     dtype,
     tactic: SplitKTactic,
     use_pdl: bool,
-    has_bias: bool,
     leading_dims: tuple[int, int, int],
-    epilogue_mode: str = "none",
+    epilogue_mode: str,
     epilogue_scale: float = 1.0,
     epilogue_group: int = 1,
 ):
@@ -1100,7 +1019,6 @@ def _get_compiled_splitk_kernel(
         dtype,
         tactic,
         use_pdl,
-        has_bias,
         epilogue_mode,
         epilogue_scale,
         epilogue_group,
@@ -1118,29 +1036,29 @@ def _get_compiled_splitk_kernel(
     kernel = SplitKDenseGemmKernel(
         tactic=tactic,
         use_pdl=use_pdl,
-        has_bias=has_bias,
+        # Only HC's SiLU/gate entry points remain. Keep the upstream device
+        # template intact; its bias branch is compile-time disabled.
+        has_bias=False,
         epilogue_mode=epilogue_mode,
         epilogue_scale=epilogue_scale,
         epilogue_group=epilogue_group,
     )
     compile_tensors = _make_compile_repr_tensors(
-        dtype, has_bias, *leading_dims, epilogue_mode=epilogue_mode
+        dtype, *leading_dims, epilogue_mode=epilogue_mode
     )
     stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
     if epilogue_mode == "gate":
         compiled = cute_ext.compile(_bmm_gate, kernel, *compile_tensors, stream)
-    elif has_bias:
-        compiled = cute_ext.compile(_bmm_bias, kernel, *compile_tensors, stream)
     else:
         compiled = cute_ext.compile(_bmm_no_bias, kernel, *compile_tensors[:3], stream)
     _SPLITK_COMPILE_CACHE[key] = compiled
     return compiled
 
 
-def _validate_runtime_tensors(a, b, bias, out) -> tuple[int, int, int]:
-    tensors = (a, b, out) + ((bias,) if bias is not None else ())
+def _validate_runtime_tensors(a, b, out) -> tuple[int, int, int]:
+    tensors = (a, b, out)
     if any(not isinstance(tensor, _torch.Tensor) for tensor in tensors):
-        raise ValueError("a, b, out, and bias must be torch tensors")
+        raise ValueError("a, b, and out must be torch tensors")
     if a.ndim != 2 or b.ndim != 2 or out.ndim != 2:
         raise ValueError("split-K dense GEMM accepts only 2D tensors")
     if a.device.type != "cuda" or any(tensor.device != a.device for tensor in tensors):
@@ -1148,7 +1066,7 @@ def _validate_runtime_tensors(a, b, bias, out) -> tuple[int, int, int]:
     if a.dtype not in _SUPPORTED_TORCH_DTYPES or any(
         tensor.dtype != a.dtype for tensor in tensors
     ):
-        raise ValueError("a, b, out, and bias must share BF16 or FP16 dtype")
+        raise ValueError("a, b, and out must share BF16 or FP16 dtype")
 
     def _is_dense_2d(tensor: _torch.Tensor) -> bool:
         rows, cols = tensor.shape
@@ -1172,42 +1090,8 @@ def _validate_runtime_tensors(a, b, bias, out) -> tuple[int, int, int]:
     n = b.shape[1]
     if out.shape != (m, n):
         raise ValueError(f"out must have shape {(m, n)}, got {tuple(out.shape)}")
-    if bias is not None and (
-        bias.ndim != 1 or bias.shape[0] != n or not bias.is_contiguous()
-    ):
-        raise ValueError(
-            f"bias must be contiguous with shape {(n,)}, "
-            f"got shape {tuple(bias.shape)} and stride {bias.stride()}"
-        )
 
     return m, n, k
-
-
-def run_splitk_dense(
-    a,
-    b,
-    bias,
-    out,
-    pdl: bool,
-    tactic: SplitKTactic,
-):
-    """Run ``A[M,K] @ B[K,N]`` with the ``mm_bf16`` layouts."""
-    validate_tactic(tactic, *_validate_runtime_tensors(a, b, bias, out))
-    has_bias = bias is not None
-    cute_tensors = _to_cute_swap(a, b, out, bias)
-    compiled = _get_compiled_splitk_kernel(
-        dtype=a.dtype,
-        tactic=tactic,
-        use_pdl=pdl,
-        has_bias=has_bias,
-        leading_dims=cute_tensors[4],
-    )
-    stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
-    if has_bias:
-        compiled(*cute_tensors[:4], stream)
-    else:
-        compiled(*cute_tensors[:3], stream)
-    return out
 
 
 def run_splitk_dense_silu(
@@ -1219,14 +1103,13 @@ def run_splitk_dense_silu(
     scale: float,
 ):
     """Run ``bf16(silu(scale * (A[M,K] @ B[K,N])))``."""
-    validate_tactic(tactic, *_validate_runtime_tensors(a, b, None, out))
-    cute_tensors = _to_cute_swap(a, b, out, None)
+    validate_tactic(tactic, *_validate_runtime_tensors(a, b, out))
+    cute_tensors = _to_cute_swap(a, b, out)
     compiled = _get_compiled_splitk_kernel(
         dtype=a.dtype,
         tactic=tactic,
         use_pdl=pdl,
-        has_bias=False,
-        leading_dims=cute_tensors[4],
+        leading_dims=cute_tensors[3],
         epilogue_mode="silu",
         epilogue_scale=scale,
     )
@@ -1249,7 +1132,7 @@ def run_splitk_dense_gate(
     ``out[m, j] = bf16(scale * sum_g sigmoid(logits[m, j*group+g]) *
     fp32(x[m, g*hs+j]))``; the logits matrix is never materialized and ``x``
     doubles as its shape anchor."""
-    m, n, k = _validate_runtime_tensors(a, b, None, x)
+    m, n, k = _validate_runtime_tensors(a, b, x)
     validate_tactic(tactic, m, n, k)
     if n % group:
         raise ValueError(f"N={n} must be divisible by group={group}")
@@ -1272,13 +1155,12 @@ def run_splitk_dense_gate(
             f"gate out must be a 32-byte-aligned row-major {(m, hs)} tensor "
             f"matching a, and x must be row-major"
         )
-    cute_tensors = _to_cute_swap(a, b, x, None)
+    cute_tensors = _to_cute_swap(a, b, x)
     compiled = _get_compiled_splitk_kernel(
         dtype=a.dtype,
         tactic=tactic,
         use_pdl=pdl,
-        has_bias=False,
-        leading_dims=cute_tensors[4],
+        leading_dims=cute_tensors[3],
         epilogue_mode="gate",
         epilogue_scale=scale,
         epilogue_group=group,

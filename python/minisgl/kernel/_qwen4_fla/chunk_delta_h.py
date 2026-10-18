@@ -8,18 +8,13 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-
 from minisgl.kernel._qwen4_fla.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
 )
 from minisgl.kernel._qwen4_fla.op import exp, exp2, safe_exp
-from minisgl.kernel._qwen4_fla.utils import (
-    autotune_cache_kwargs,
-    is_nvidia_hopper,
-)
+from minisgl.kernel._qwen4_fla.utils import autotune_cache_kwargs
 
-NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
 GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
 GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))

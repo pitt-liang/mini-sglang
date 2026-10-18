@@ -7,7 +7,6 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-
 from minisgl.kernel._qwen4_fla.index import prepare_chunk_indices
 
 
@@ -153,6 +152,3 @@ def recompute_w_u_fwd(
         num_stages=3,
     )
     return w, u
-
-
-fwd_recompute_w_u = recompute_w_u_fwd
